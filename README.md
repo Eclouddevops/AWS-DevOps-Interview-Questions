@@ -21,6 +21,7 @@ A comprehensive collection of **200+ deep-dive interview questions with detailed
 | 13 | Error Codes & Troubleshooting | [Error-Codes-Troubleshooting.md](./Error-Codes-Troubleshooting.md) | 12 |
 | 14 | Git / Bitbucket CI-CD Pipelines | [Git-CICD-Pipeline.md](./Git-CICD-Pipeline.md) | 12 |
 | 15 | Linux & Windows Servers | [Linux-Windows-Servers.md](./Linux-Windows-Servers.md) | 15 |
+| 16 | AWS CloudWatch Metrics Deep Dive | [AWS-CloudWatch-Metrics-DeepDive.md](./AWS-CloudWatch-Metrics-DeepDive.md) | 25 |
 
 ## Key Features
 
