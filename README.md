@@ -1,6 +1,6 @@
 # AWS DevOps Interview Questions — Deep-Dive Collection
 
-A comprehensive collection of **250+ deep-dive interview questions with detailed answers** covering all major AWS and DevOps topics. Designed for L3/L4 level interviews with tricky, scenario-based questions.
+A comprehensive collection of **300+ deep-dive interview questions with detailed answers** covering all major AWS and DevOps topics. Designed for L3/L4 level interviews with tricky, scenario-based questions.
 
 ## Topics Covered
 
@@ -23,6 +23,7 @@ A comprehensive collection of **250+ deep-dive interview questions with detailed
 | 15 | Linux & Windows Servers | [Linux-Windows-Servers.md](./Linux-Windows-Servers.md) | 15 |
 | 16 | AWS CloudWatch Metrics Deep Dive | [AWS-CloudWatch-Metrics-DeepDive.md](./AWS-CloudWatch-Metrics-DeepDive.md) | 25 |
 | 17 | SSL Certificates, CA & AWS Certificate Manager | [SSL-CA-AWS-CertificateManager.md](./SSL-CA-AWS-CertificateManager.md) | 50 |
+| 18 | AWS RDS Deep Dive (Aurora, Multi-AZ, Replicas) | [AWS-RDS-DeepDive.md](./AWS-RDS-DeepDive.md) | 40 |
 
 ## Key Features
 
