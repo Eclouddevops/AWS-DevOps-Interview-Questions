@@ -9,6 +9,7 @@
 6. [ACM Private CA](#acm-private-ca)
 7. [Certificate Implementation Scenarios](#certificate-implementation-scenarios)
 8. [Troubleshooting & Tricky Scenarios](#troubleshooting--tricky-scenarios)
+9. [Practical: Creating CA Certificates & Wildcard Certs via CLI](#practical-creating-ca-certificates--wildcard-certs-via-cli)
 
 ---
 
@@ -2120,3 +2121,1586 @@ jobs:
 ```
 
 **Tricky**: The biggest risk in certificate management is the "unknown unknowns" — certificates that nobody is tracking. Shadow IT, developer test environments, IoT devices with embedded certs. Start with a comprehensive discovery/inventory phase before building automation.
+
+
+
+---
+
+## Practical: Creating CA Certificates & Wildcard Certs via CLI
+
+**Q41: How do you create your own Certificate Authority (CA) from scratch using OpenSSL CLI?**
+
+**A:**
+
+```bash
+# ============================================
+# STEP 1: Create the Root CA
+# ============================================
+
+# Create directory structure
+mkdir -p ~/myCA/{certs,crl,newcerts,private,csr}
+touch ~/myCA/index.txt
+echo 1000 > ~/myCA/serial
+
+# Generate Root CA private key (4096-bit RSA, encrypted)
+openssl genrsa -aes256 -out ~/myCA/private/ca.key 4096
+# Enter passphrase (protect this key with your life!)
+
+# Verify the key
+openssl rsa -in ~/myCA/private/ca.key -check
+
+# Generate Root CA certificate (self-signed, 10-year validity)
+openssl req -x509 -new -nodes \
+  -key ~/myCA/private/ca.key \
+  -sha256 -days 3650 \
+  -out ~/myCA/certs/ca.crt \
+  -subj "/C=US/ST=California/L=SanFrancisco/O=MyCompany/OU=DevOps/CN=MyCompany Root CA"
+
+# Verify the CA certificate
+openssl x509 -in ~/myCA/certs/ca.crt -text -noout
+```
+
+
+```bash
+# ============================================
+# STEP 2: Create an Intermediate CA (recommended for production)
+# ============================================
+
+# Generate Intermediate CA private key
+openssl genrsa -aes256 -out ~/myCA/private/intermediate.key 4096
+
+# Generate CSR for Intermediate CA
+openssl req -new \
+  -key ~/myCA/private/intermediate.key \
+  -out ~/myCA/csr/intermediate.csr \
+  -subj "/C=US/ST=California/L=SanFrancisco/O=MyCompany/OU=DevOps/CN=MyCompany Intermediate CA"
+
+# Sign Intermediate CA cert with Root CA (5-year validity)
+openssl x509 -req \
+  -in ~/myCA/csr/intermediate.csr \
+  -CA ~/myCA/certs/ca.crt \
+  -CAkey ~/myCA/private/ca.key \
+  -CAcreateserial \
+  -out ~/myCA/certs/intermediate.crt \
+  -days 1825 -sha256 \
+  -extfile <(printf "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,digitalSignature,cRLSign,keyCertSign")
+
+# Create the certificate chain file
+cat ~/myCA/certs/intermediate.crt ~/myCA/certs/ca.crt > ~/myCA/certs/ca-chain.crt
+
+# Verify the chain
+openssl verify -CAfile ~/myCA/certs/ca.crt ~/myCA/certs/intermediate.crt
+```
+
+
+**Key outputs:**
+```
+~/myCA/
+├── private/
+│   ├── ca.key              ← Root CA private key (KEEP OFFLINE & SECURE!)
+│   └── intermediate.key    ← Intermediate CA private key
+├── certs/
+│   ├── ca.crt              ← Root CA certificate (distribute to clients)
+│   ├── intermediate.crt    ← Intermediate CA certificate
+│   └── ca-chain.crt        ← Full chain (intermediate + root)
+└── csr/
+    └── intermediate.csr    ← Intermediate CSR (can be discarded after signing)
+```
+
+**Tricky**: The Root CA private key (`ca.key`) should be kept OFFLINE after signing the intermediate CA. Store it on an air-gapped machine or HSM. If compromised, your entire PKI is broken and every certificate issued becomes untrustworthy.
+
+**Tricky**: The `-nodes` flag means "no DES" (no encryption on the private key). Use it only for automation; for interactive use, encrypt the key with `-aes256`.
+
+---
+
+
+**Q42: How do you create a Wildcard SSL certificate using OpenSSL CLI and sign it with your CA?**
+
+**A:**
+
+```bash
+# ============================================
+# STEP 1: Generate private key for the wildcard cert
+# ============================================
+
+# RSA 2048-bit key (unencrypted for server use)
+openssl genrsa -out wildcard.example.com.key 2048
+
+# OR use ECDSA (smaller, faster)
+openssl ecparam -genkey -name prime256v1 -out wildcard.example.com.key
+
+# ============================================
+# STEP 2: Create OpenSSL config with SAN extensions
+# ============================================
+cat > wildcard.cnf << 'EOF'
+[req]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+distinguished_name = dn
+req_extensions     = v3_req
+
+[dn]
+C  = US
+ST = California
+L  = San Francisco
+O  = MyCompany
+OU = Engineering
+CN = *.example.com
+
+[v3_req]
+basicConstraints     = CA:FALSE
+keyUsage             = critical,digitalSignature,keyEncipherment
+extendedKeyUsage     = serverAuth,clientAuth
+subjectAltName       = @alt_names
+
+[alt_names]
+DNS.1 = *.example.com
+DNS.2 = example.com
+DNS.3 = *.staging.example.com
+EOF
+```
+
+
+```bash
+# ============================================
+# STEP 3: Generate CSR using the config
+# ============================================
+openssl req -new \
+  -key wildcard.example.com.key \
+  -out wildcard.example.com.csr \
+  -config wildcard.cnf
+
+# Verify CSR content (check SANs are present)
+openssl req -in wildcard.example.com.csr -text -noout | grep -A4 "Subject Alternative Name"
+
+# ============================================
+# STEP 4: Sign the CSR with your CA (Intermediate CA)
+# ============================================
+openssl x509 -req \
+  -in wildcard.example.com.csr \
+  -CA ~/myCA/certs/intermediate.crt \
+  -CAkey ~/myCA/private/intermediate.key \
+  -CAcreateserial \
+  -out wildcard.example.com.crt \
+  -days 365 -sha256 \
+  -extensions v3_req \
+  -extfile wildcard.cnf
+
+# ============================================
+# STEP 5: Verify the certificate
+# ============================================
+
+# Check certificate details
+openssl x509 -in wildcard.example.com.crt -text -noout
+
+# Verify against the CA chain
+openssl verify -CAfile ~/myCA/certs/ca-chain.crt wildcard.example.com.crt
+
+# Verify key matches certificate
+openssl x509 -noout -modulus -in wildcard.example.com.crt | openssl md5
+openssl rsa  -noout -modulus -in wildcard.example.com.key | openssl md5
+# Both MD5 outputs must be identical!
+```
+
+
+**Final output files:**
+```
+wildcard.example.com.key   ← Private key (install on server, NEVER share)
+wildcard.example.com.csr   ← CSR (can be discarded after signing)
+wildcard.example.com.crt   ← Signed wildcard certificate
+~/myCA/certs/ca-chain.crt  ← CA chain (intermediate + root)
+```
+
+**Tricky**: Wildcard `*.example.com` does NOT cover:
+- The bare domain `example.com` (add it as SAN DNS.2)
+- Sub-subdomains like `a.b.example.com` (wildcard is single-level only)
+- You MUST include SANs — modern browsers ignore CN and only check SAN fields
+
+**Tricky**: When signing with `-extfile`, the extensions in the CSR are NOT automatically copied to the cert. You must pass them explicitly with `-extensions` and `-extfile` during signing. Without this, your SANs will be missing from the final certificate!
+
+---
+
+
+**Q43: How do you create a wildcard certificate using AWS ACM via CLI and attach it to an ALB?**
+
+**A:**
+
+```bash
+# ============================================
+# STEP 1: Request a wildcard certificate from ACM
+# ============================================
+
+aws acm request-certificate \
+  --domain-name "*.example.com" \
+  --subject-alternative-names "example.com" "*.staging.example.com" \
+  --validation-method DNS \
+  --region us-east-1 \
+  --tags Key=Environment,Value=Production Key=Team,Value=DevOps
+
+# Output: CertificateArn: arn:aws:acm:us-east-1:123456789:certificate/abc-123-def
+
+# ============================================
+# STEP 2: Get DNS validation records
+# ============================================
+
+CERT_ARN="arn:aws:acm:us-east-1:123456789:certificate/abc-123-def"
+
+aws acm describe-certificate \
+  --certificate-arn $CERT_ARN \
+  --query 'Certificate.DomainValidationOptions[].ResourceRecord' \
+  --output table
+
+# Output example:
+# Name: _abc123.example.com
+# Type: CNAME
+# Value: _xyz789.acm-validations.aws
+
+# ============================================
+# STEP 3: Create DNS validation record in Route 53
+# ============================================
+
+HOSTED_ZONE_ID="Z1234567890ABC"
+
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "_abc123.example.com",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "_xyz789.acm-validations.aws"}]
+      }
+    }]
+  }'
+
+# ============================================
+# STEP 4: Wait for certificate validation
+# ============================================
+
+aws acm wait certificate-validated --certificate-arn $CERT_ARN
+echo "Certificate validated successfully!"
+
+# Check status
+aws acm describe-certificate \
+  --certificate-arn $CERT_ARN \
+  --query 'Certificate.Status'
+# Should return: "ISSUED"
+```
+
+
+```bash
+# ============================================
+# STEP 5: Create ALB HTTPS Listener with ACM cert
+# ============================================
+
+# Create HTTPS listener on port 443
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:123456789:loadbalancer/app/my-alb/abc123 \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=$CERT_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:us-east-1:123456789:targetgroup/my-tg/def456
+
+# Add HTTP to HTTPS redirect (port 80 → 443)
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:123456789:loadbalancer/app/my-alb/abc123 \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions '[{
+    "Type": "redirect",
+    "RedirectConfig": {
+      "Protocol": "HTTPS",
+      "Port": "443",
+      "StatusCode": "HTTP_301"
+    }
+  }]'
+
+# Add additional certificates (SNI - multiple domains on same ALB)
+aws elbv2 add-listener-certificates \
+  --listener-arn arn:aws:elasticloadbalancing:us-east-1:123456789:listener/app/my-alb/abc123/listener456 \
+  --certificates CertificateArn=arn:aws:acm:us-east-1:123456789:certificate/second-cert
+
+# Verify listener configuration
+aws elbv2 describe-listeners \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:123456789:loadbalancer/app/my-alb/abc123
+```
+
+**Tricky**: The SSL policy `ELBSecurityPolicy-TLS13-1-2-2021-06` enables TLS 1.3 with TLS 1.2 fallback. For maximum security with no legacy support, use `ELBSecurityPolicy-TLS13-1-3-2021-06` (TLS 1.3 only).
+
+---
+
+
+**Q44: How do you configure a wildcard SSL certificate with AWS CloudFront via CLI?**
+
+**A:**
+
+```bash
+# ============================================
+# IMPORTANT: CloudFront requires cert in us-east-1 (N. Virginia)
+# ============================================
+
+# Step 1: Request cert in us-east-1 (if not already done)
+CERT_ARN=$(aws acm request-certificate \
+  --domain-name "*.example.com" \
+  --subject-alternative-names "example.com" \
+  --validation-method DNS \
+  --region us-east-1 \
+  --query 'CertificateArn' --output text)
+
+echo "Certificate ARN: $CERT_ARN"
+
+# Step 2: Validate (same DNS validation as above)
+# ... (create Route 53 CNAME record, wait for validation)
+
+# Step 3: Create CloudFront distribution with custom SSL cert
+aws cloudfront create-distribution \
+  --distribution-config '{
+    "CallerReference": "unique-ref-'$(date +%s)'",
+    "Aliases": {
+      "Quantity": 2,
+      "Items": ["www.example.com", "app.example.com"]
+    },
+    "Origins": {
+      "Quantity": 1,
+      "Items": [{
+        "Id": "myALBOrigin",
+        "DomainName": "my-alb-123456.us-east-1.elb.amazonaws.com",
+        "CustomOriginConfig": {
+          "HTTPPort": 80,
+          "HTTPSPort": 443,
+          "OriginProtocolPolicy": "https-only",
+          "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}
+        }
+      }]
+    },
+    "DefaultCacheBehavior": {
+      "TargetOriginId": "myALBOrigin",
+      "ViewerProtocolPolicy": "redirect-to-https",
+      "AllowedMethods": {"Quantity": 7, "Items": ["GET","HEAD","OPTIONS","PUT","POST","PATCH","DELETE"]},
+      "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+      "Compress": true
+    },
+    "ViewerCertificate": {
+      "ACMCertificateArn": "'$CERT_ARN'",
+      "SSLSupportMethod": "sni-only",
+      "MinimumProtocolVersion": "TLSv1.2_2021",
+      "Certificate": "'$CERT_ARN'",
+      "CertificateSource": "acm"
+    },
+    "Enabled": true,
+    "Comment": "Production distribution with wildcard cert"
+  }'
+```
+
+
+```bash
+# Update existing distribution to use new cert
+DIST_ID="E1A2B3C4D5E6F7"
+
+# Get current config
+aws cloudfront get-distribution-config --id $DIST_ID > dist-config.json
+
+# Extract ETag (required for update)
+ETAG=$(jq -r '.ETag' dist-config.json)
+
+# Modify ViewerCertificate in the config, then update:
+aws cloudfront update-distribution \
+  --id $DIST_ID \
+  --if-match $ETAG \
+  --distribution-config file://updated-dist-config.json
+
+# Create Route 53 alias record pointing to CloudFront
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "www.example.com",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "Z2FDTNDATAQYW2",
+          "DNSName": "d1234abcdef.cloudfront.net",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }]
+  }'
+```
+
+**Key points:**
+```
+CloudFront SSL Configuration:
+├── Certificate MUST be in us-east-1 (regardless of origin region)
+├── SSLSupportMethod options:
+│   ├── "sni-only" — Free, requires SNI-capable clients (99.9% support)
+│   └── "vip" — Dedicated IP, $600/month (for ancient clients)
+├── MinimumProtocolVersion: "TLSv1.2_2021" (recommended)
+├── Aliases must match certificate SANs
+└── Wildcard cert *.example.com works for any subdomain alias
+```
+
+**Tricky**: You CANNOT use the default `d1234.cloudfront.net` domain with a custom SSL cert. Custom certs require custom domain names (Aliases/CNAMEs). The CloudFront domain always uses Amazon's own certificate.
+
+---
+
+
+**Q45: How do you configure a wildcard SSL certificate directly on an EC2 instance (Nginx & Apache)?**
+
+**A:**
+
+```bash
+# ============================================
+# METHOD 1: Using your own CA cert (from Q41/Q42)
+# ============================================
+
+# Copy certificate files to EC2 instance
+scp wildcard.example.com.crt ec2-user@<EC2-IP>:/tmp/
+scp wildcard.example.com.key ec2-user@<EC2-IP>:/tmp/
+scp ~/myCA/certs/ca-chain.crt ec2-user@<EC2-IP>:/tmp/
+
+# SSH into the instance
+ssh ec2-user@<EC2-IP>
+
+# Move certs to proper locations (secure permissions!)
+sudo mkdir -p /etc/ssl/certs /etc/ssl/private
+sudo cp /tmp/wildcard.example.com.crt /etc/ssl/certs/
+sudo cp /tmp/ca-chain.crt /etc/ssl/certs/
+sudo cp /tmp/wildcard.example.com.key /etc/ssl/private/
+sudo chmod 600 /etc/ssl/private/wildcard.example.com.key
+sudo chmod 644 /etc/ssl/certs/wildcard.example.com.crt
+sudo chown root:root /etc/ssl/private/wildcard.example.com.key
+```
+
+
+```nginx
+# ============================================
+# NGINX Configuration (/etc/nginx/conf.d/ssl.conf)
+# ============================================
+
+server {
+    listen 80;
+    server_name *.example.com example.com;
+    # Redirect all HTTP to HTTPS
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name *.example.com example.com;
+
+    # SSL Certificate files
+    ssl_certificate     /etc/ssl/certs/wildcard.example.com.crt;
+    ssl_certificate_key /etc/ssl/private/wildcard.example.com.key;
+    ssl_trusted_certificate /etc/ssl/certs/ca-chain.crt;
+
+    # TLS configuration (strong settings)
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305';
+    ssl_prefer_server_ciphers on;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_tickets off;
+
+    # OCSP Stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+
+    # HSTS (2 years)
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # Application
+    root /var/www/html;
+    index index.html;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+
+```apache
+# ============================================
+# APACHE Configuration (/etc/httpd/conf.d/ssl.conf)
+# ============================================
+
+<VirtualHost *:80>
+    ServerName example.com
+    ServerAlias *.example.com
+    Redirect permanent / https://example.com/
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName example.com
+    ServerAlias *.example.com
+    DocumentRoot /var/www/html
+
+    SSLEngine on
+    SSLCertificateFile      /etc/ssl/certs/wildcard.example.com.crt
+    SSLCertificateKeyFile   /etc/ssl/private/wildcard.example.com.key
+    SSLCertificateChainFile /etc/ssl/certs/ca-chain.crt
+
+    # Strong TLS settings
+    SSLProtocol             all -SSLv3 -TLSv1 -TLSv1.1
+    SSLCipherSuite          ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+    SSLHonorCipherOrder     on
+
+    # HSTS
+    Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+
+    # Proxy to application
+    ProxyPass / http://127.0.0.1:3000/
+    ProxyPassReverse / http://127.0.0.1:3000/
+</VirtualHost>
+```
+
+
+```bash
+# ============================================
+# METHOD 2: Using Let's Encrypt (Certbot) on EC2
+# ============================================
+
+# Install certbot
+sudo yum install -y certbot python3-certbot-nginx   # Amazon Linux 2
+# OR
+sudo apt install -y certbot python3-certbot-nginx    # Ubuntu
+
+# Obtain wildcard cert (requires DNS-01 challenge)
+sudo certbot certonly \
+  --manual \
+  --preferred-challenges dns \
+  -d "*.example.com" \
+  -d "example.com" \
+  --email admin@example.com \
+  --agree-tos
+
+# For automated renewal with Route 53 DNS plugin:
+sudo pip3 install certbot-dns-route53
+
+sudo certbot certonly \
+  --dns-route53 \
+  -d "*.example.com" \
+  -d "example.com" \
+  --email admin@example.com \
+  --agree-tos
+
+# Certbot stores certs at:
+# /etc/letsencrypt/live/example.com/fullchain.pem  (cert + chain)
+# /etc/letsencrypt/live/example.com/privkey.pem    (private key)
+# /etc/letsencrypt/live/example.com/cert.pem       (cert only)
+# /etc/letsencrypt/live/example.com/chain.pem      (chain only)
+
+# Test auto-renewal
+sudo certbot renew --dry-run
+
+# Reload Nginx after renewal (add to certbot deploy hook)
+echo '#!/bin/bash
+nginx -s reload' | sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+```
+
+
+```bash
+# ============================================
+# Verify & Test on EC2
+# ============================================
+
+# Test Nginx configuration
+sudo nginx -t
+
+# Reload Nginx (graceful, no downtime)
+sudo nginx -s reload
+# OR restart Apache
+sudo systemctl restart httpd
+
+# Test HTTPS locally
+curl -vk https://localhost
+curl --cacert /etc/ssl/certs/ca-chain.crt https://app.example.com
+
+# Check from outside (after DNS setup)
+openssl s_client -connect app.example.com:443 -servername app.example.com
+```
+
+**Security Group for EC2 with direct HTTPS:**
+```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-123456 \
+  --protocol tcp --port 443 --cidr 0.0.0.0/0
+
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-123456 \
+  --protocol tcp --port 80 --cidr 0.0.0.0/0  # For HTTP→HTTPS redirect
+```
+
+**Tricky**: On EC2, the private key file (`*.key`) must have `600` permissions and be owned by root (or the web server user). If permissions are too open, Nginx/Apache will refuse to start with "SSL_CTX_use_PrivateKey_file... permission denied".
+
+**Tricky**: For ACM public certificates, you CANNOT install them on EC2 directly — the private key is never exported. You must use an ALB/NLB/CloudFront in front, or use Let's Encrypt / your own CA / ACM Private CA for direct EC2 TLS.
+
+---
+
+
+**Q46: How do you configure SSL/TLS certificates with Docker containers?**
+
+**A:**
+
+```bash
+# ============================================
+# METHOD 1: Mount certificates as volumes (Recommended for production)
+# ============================================
+
+# Directory structure on host:
+# /opt/certs/
+# ├── wildcard.example.com.crt
+# ├── wildcard.example.com.key
+# └── ca-chain.crt
+
+# Run Nginx container with mounted certs
+docker run -d \
+  --name nginx-ssl \
+  -p 443:443 -p 80:80 \
+  -v /opt/certs/wildcard.example.com.crt:/etc/nginx/ssl/cert.crt:ro \
+  -v /opt/certs/wildcard.example.com.key:/etc/nginx/ssl/cert.key:ro \
+  -v /opt/certs/ca-chain.crt:/etc/nginx/ssl/ca-chain.crt:ro \
+  -v /opt/nginx/conf.d:/etc/nginx/conf.d:ro \
+  nginx:alpine
+
+# ============================================
+# METHOD 2: Build certs into the Docker image (NOT recommended for prod)
+# ============================================
+
+# Dockerfile
+cat > Dockerfile << 'EOF'
+FROM nginx:alpine
+
+# Copy certificates (use multi-stage or secrets in production!)
+COPY certs/wildcard.example.com.crt /etc/nginx/ssl/cert.crt
+COPY certs/wildcard.example.com.key /etc/nginx/ssl/cert.key
+COPY certs/ca-chain.crt /etc/nginx/ssl/ca-chain.crt
+COPY nginx-ssl.conf /etc/nginx/conf.d/default.conf
+
+# Set proper permissions
+RUN chmod 600 /etc/nginx/ssl/cert.key && \
+    chmod 644 /etc/nginx/ssl/cert.crt /etc/nginx/ssl/ca-chain.crt
+
+EXPOSE 443 80
+CMD ["nginx", "-g", "daemon off;"]
+EOF
+
+docker build -t my-app-ssl .
+docker run -d -p 443:443 -p 80:80 my-app-ssl
+```
+
+
+```bash
+# ============================================
+# METHOD 3: Docker Secrets (Swarm mode — secure!)
+# ============================================
+
+# Create secrets
+docker secret create ssl_cert wildcard.example.com.crt
+docker secret create ssl_key wildcard.example.com.key
+docker secret create ssl_chain ca-chain.crt
+
+# Deploy service with secrets
+docker service create \
+  --name web-app \
+  --secret ssl_cert \
+  --secret ssl_key \
+  --secret ssl_chain \
+  --publish 443:443 \
+  my-app-ssl
+
+# Secrets are available at /run/secrets/ inside the container:
+# /run/secrets/ssl_cert
+# /run/secrets/ssl_key
+# /run/secrets/ssl_chain
+```
+
+```yaml
+# ============================================
+# METHOD 4: Docker Compose with SSL
+# ============================================
+
+# docker-compose.yml
+version: '3.8'
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./certs/wildcard.example.com.crt:/etc/nginx/ssl/cert.crt:ro
+      - ./certs/wildcard.example.com.key:/etc/nginx/ssl/cert.key:ro
+      - ./certs/ca-chain.crt:/etc/nginx/ssl/ca-chain.crt:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-k", "https://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  app:
+    image: my-app:latest
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=production
+```
+
+
+```bash
+# ============================================
+# METHOD 5: Using AWS Secrets Manager with ECS/Docker
+# ============================================
+
+# Store cert in Secrets Manager
+aws secretsmanager create-secret \
+  --name prod/ssl/wildcard-cert \
+  --secret-string '{
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIIF...\n-----END CERTIFICATE-----",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----",
+    "chain": "-----BEGIN CERTIFICATE-----\nMIIF...\n-----END CERTIFICATE-----"
+  }'
+
+# In ECS Task Definition — inject as environment or fetch at startup:
+# entrypoint.sh
+#!/bin/bash
+# Fetch cert from Secrets Manager at container startup
+SECRET=$(aws secretsmanager get-secret-value --secret-id prod/ssl/wildcard-cert --query 'SecretString' --output text)
+
+echo $SECRET | jq -r '.certificate' > /etc/nginx/ssl/cert.crt
+echo $SECRET | jq -r '.private_key' > /etc/nginx/ssl/cert.key
+echo $SECRET | jq -r '.chain' > /etc/nginx/ssl/ca-chain.crt
+
+chmod 600 /etc/nginx/ssl/cert.key
+exec nginx -g 'daemon off;'
+```
+
+
+```bash
+# ============================================
+# METHOD 6: Traefik reverse proxy with automatic Let's Encrypt
+# ============================================
+
+# docker-compose.yml (Traefik auto-SSL with Let's Encrypt)
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v2.10
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=admin@example.com"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+
+  my-app:
+    image: my-app:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.myapp.rule=Host(`app.example.com`)"
+      - "traefik.http.routers.myapp.entrypoints=websecure"
+      - "traefik.http.routers.myapp.tls.certresolver=myresolver"
+
+volumes:
+  letsencrypt:
+```
+
+**Best practices comparison:**
+
+| Method | Security | Automation | Use Case |
+|--------|----------|------------|----------|
+| Volume mount | Good | Manual rotation | Single host, dev/staging |
+| Build into image | Poor (key in image!) | Rebuild required | Never in production |
+| Docker Secrets | Excellent | Swarm-managed | Docker Swarm production |
+| Secrets Manager + ECS | Excellent | Lambda rotation | AWS ECS production |
+| Traefik/Certbot auto | Good | Fully automatic | Self-hosted, Let's Encrypt |
+| ALB in front of Docker | Best | ACM auto-renewal | AWS production (recommended) |
+
+**Tricky**: NEVER bake private keys into Docker images. Images are stored in registries, cached on hosts, and can be pulled by anyone with registry access. Use runtime injection (volumes, secrets, Secrets Manager).
+
+**Tricky**: When using Docker volumes for certs, use `:ro` (read-only) flag. The container should never need write access to certificate files.
+
+---
+
+
+**Q47: How do you import your own CA/wildcard certificate into ACM and use it with NLB for TCP passthrough to EC2/Docker?**
+
+**A:**
+
+```bash
+# ============================================
+# Scenario: Your own CA cert → ACM → NLB (TLS) → EC2/Docker
+# ============================================
+
+# Step 1: Import your CA-signed wildcard cert into ACM
+aws acm import-certificate \
+  --certificate fileb://wildcard.example.com.crt \
+  --private-key fileb://wildcard.example.com.key \
+  --certificate-chain fileb://ca-chain.crt \
+  --region us-east-1 \
+  --tags Key=Name,Value=wildcard-example-com
+
+# Returns: CertificateArn
+CERT_ARN="arn:aws:acm:us-east-1:123456789:certificate/imported-abc-123"
+
+# Step 2: Create NLB with TLS listener (TLS termination at NLB)
+# Create NLB
+NLB_ARN=$(aws elbv2 create-load-balancer \
+  --name my-nlb-tls \
+  --type network \
+  --subnets subnet-111 subnet-222 \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+
+# Create target group (targets receive plain TCP after TLS termination)
+TG_ARN=$(aws elbv2 create-target-group \
+  --name my-tg-tcp \
+  --protocol TCP \
+  --port 80 \
+  --vpc-id vpc-123456 \
+  --target-type instance \
+  --health-check-protocol TCP \
+  --health-check-port 80 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+# Register EC2 target
+aws elbv2 register-targets \
+  --target-group-arn $TG_ARN \
+  --targets Id=i-0123456789abcdef0,Port=80
+
+# Create TLS listener (NLB terminates TLS)
+aws elbv2 create-listener \
+  --load-balancer-arn $NLB_ARN \
+  --protocol TLS \
+  --port 443 \
+  --certificates CertificateArn=$CERT_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
+```
+
+
+```bash
+# ============================================
+# Alternative: NLB TCP passthrough (TLS terminated at target/Docker)
+# ============================================
+
+# Target group with TCP (passthrough — NLB does NOT decrypt)
+TG_ARN=$(aws elbv2 create-target-group \
+  --name my-tg-passthrough \
+  --protocol TCP \
+  --port 443 \
+  --vpc-id vpc-123456 \
+  --target-type instance \
+  --health-check-protocol TCP \
+  --health-check-port 443 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+# TCP listener (no certificate on NLB — passes raw TLS to target)
+aws elbv2 create-listener \
+  --load-balancer-arn $NLB_ARN \
+  --protocol TCP \
+  --port 443 \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
+
+# Docker container on EC2 handles TLS directly:
+docker run -d \
+  --name app-tls \
+  -p 443:443 \
+  -v /opt/certs:/etc/nginx/ssl:ro \
+  -v /opt/nginx/conf.d:/etc/nginx/conf.d:ro \
+  nginx:alpine
+```
+
+**Comparison: TLS at NLB vs TCP Passthrough:**
+
+| Feature | NLB TLS Listener | NLB TCP Passthrough |
+|---------|-----------------|---------------------|
+| TLS termination | At NLB | At target (EC2/Docker) |
+| Certificate location | ACM (on NLB) | On target instance |
+| NLB can inspect traffic | No (L4 only) | No (L4 only) |
+| Client IP preservation | Yes (NLB preserves) | Yes |
+| mTLS support | No (NLB doesn't do mTLS) | Yes (target handles it) |
+| Cert management | ACM auto-renewal | Manual on each target |
+| Use case | Simple TLS offload | mTLS, end-to-end encryption, custom TLS |
+
+**Tricky**: NLB with TLS listener does NOT support mTLS (mutual TLS). If you need client certificate authentication, use TCP passthrough and terminate TLS at your application. ALB also doesn't natively support mTLS — only API Gateway does.
+
+---
+
+
+**Q48: How do you create a CA cert and wildcard cert using AWS ACM Private CA via CLI?**
+
+**A:**
+
+```bash
+# ============================================
+# STEP 1: Create a Private Certificate Authority
+# ============================================
+
+# Create the Root CA
+ROOT_CA_ARN=$(aws acm-pca create-certificate-authority \
+  --certificate-authority-type ROOT \
+  --certificate-authority-configuration '{
+    "KeyAlgorithm": "RSA_4096",
+    "SigningAlgorithm": "SHA512WITHRSA",
+    "Subject": {
+      "Country": "US",
+      "State": "California",
+      "Locality": "San Francisco",
+      "Organization": "MyCompany",
+      "OrganizationalUnit": "Engineering",
+      "CommonName": "MyCompany Root CA"
+    }
+  }' \
+  --revocation-configuration '{
+    "CrlConfiguration": {
+      "Enabled": true,
+      "ExpirationInDays": 7,
+      "S3BucketName": "my-company-crl-bucket"
+    }
+  }' \
+  --tags Key=Environment,Value=Production \
+  --query 'CertificateAuthorityArn' --output text)
+
+echo "Root CA ARN: $ROOT_CA_ARN"
+
+# ============================================
+# STEP 2: Install Root CA certificate (self-signed)
+# ============================================
+
+# Get the CSR for the Root CA
+aws acm-pca get-certificate-authority-csr \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --output text > root-ca.csr
+
+# Issue the root certificate (self-sign)
+ROOT_CERT_ARN=$(aws acm-pca issue-certificate \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --csr fileb://root-ca.csr \
+  --signing-algorithm SHA512WITHRSA \
+  --template-arn arn:aws:acm-pca:::template/RootCACertificate/V1 \
+  --validity Value=3650,Type=DAYS \
+  --query 'CertificateArn' --output text)
+
+# Wait for certificate to be issued
+aws acm-pca wait certificate-issued \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --certificate-arn $ROOT_CERT_ARN
+
+# Get the issued root certificate
+aws acm-pca get-certificate \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --certificate-arn $ROOT_CERT_ARN \
+  --query 'Certificate' --output text > root-ca.crt
+
+# Install the root certificate on the CA
+aws acm-pca import-certificate-authority-certificate \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --certificate fileb://root-ca.crt
+```
+
+
+```bash
+# ============================================
+# STEP 3: Create Subordinate (Issuing) CA
+# ============================================
+
+SUB_CA_ARN=$(aws acm-pca create-certificate-authority \
+  --certificate-authority-type SUBORDINATE \
+  --certificate-authority-configuration '{
+    "KeyAlgorithm": "RSA_2048",
+    "SigningAlgorithm": "SHA256WITHRSA",
+    "Subject": {
+      "Country": "US",
+      "State": "California",
+      "Organization": "MyCompany",
+      "CommonName": "MyCompany Issuing CA"
+    }
+  }' \
+  --query 'CertificateAuthorityArn' --output text)
+
+# Get Subordinate CA CSR
+aws acm-pca get-certificate-authority-csr \
+  --certificate-authority-arn $SUB_CA_ARN \
+  --output text > sub-ca.csr
+
+# Sign subordinate CA cert with Root CA
+SUB_CERT_ARN=$(aws acm-pca issue-certificate \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --csr fileb://sub-ca.csr \
+  --signing-algorithm SHA256WITHRSA \
+  --template-arn arn:aws:acm-pca:::template/SubordinateCACertificate_PathLen0/V1 \
+  --validity Value=1825,Type=DAYS \
+  --query 'CertificateArn' --output text)
+
+# Wait and get the cert
+aws acm-pca wait certificate-issued \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --certificate-arn $SUB_CERT_ARN
+
+# Get subordinate cert + chain
+SUB_CERT=$(aws acm-pca get-certificate \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --certificate-arn $SUB_CERT_ARN \
+  --query 'Certificate' --output text)
+
+SUB_CHAIN=$(aws acm-pca get-certificate \
+  --certificate-authority-arn $ROOT_CA_ARN \
+  --certificate-arn $SUB_CERT_ARN \
+  --query 'CertificateChain' --output text)
+
+echo "$SUB_CERT" > sub-ca.crt
+echo "$SUB_CHAIN" > sub-ca-chain.crt
+
+# Install on subordinate CA
+aws acm-pca import-certificate-authority-certificate \
+  --certificate-authority-arn $SUB_CA_ARN \
+  --certificate fileb://sub-ca.crt \
+  --certificate-chain fileb://sub-ca-chain.crt
+```
+
+
+```bash
+# ============================================
+# STEP 4: Issue a Wildcard Certificate from Private CA
+# ============================================
+
+# Method A: Using ACM (integrated — cannot export private key for EC2 use)
+WILDCARD_ARN=$(aws acm request-certificate \
+  --domain-name "*.example.com" \
+  --subject-alternative-names "example.com" \
+  --certificate-authority-arn $SUB_CA_ARN \
+  --query 'CertificateArn' --output text)
+
+# No validation needed for Private CA — cert is issued immediately!
+echo "Wildcard cert ARN: $WILDCARD_ARN"
+# Attach directly to ALB/CloudFront/API Gateway
+
+# Method B: Using ACM-PCA directly (CAN export private key — for EC2/Docker!)
+# Generate private key locally
+openssl genrsa -out wildcard.example.com.key 2048
+
+# Generate CSR
+openssl req -new \
+  -key wildcard.example.com.key \
+  -out wildcard.example.com.csr \
+  -subj "/CN=*.example.com/O=MyCompany/C=US" \
+  -addext "subjectAltName=DNS:*.example.com,DNS:example.com"
+
+# Issue certificate from Private CA
+ISSUED_CERT_ARN=$(aws acm-pca issue-certificate \
+  --certificate-authority-arn $SUB_CA_ARN \
+  --csr fileb://wildcard.example.com.csr \
+  --signing-algorithm SHA256WITHRSA \
+  --template-arn arn:aws:acm-pca:::template/EndEntityCertificate/V1 \
+  --validity Value=365,Type=DAYS \
+  --query 'CertificateArn' --output text)
+
+# Wait for issuance
+aws acm-pca wait certificate-issued \
+  --certificate-authority-arn $SUB_CA_ARN \
+  --certificate-arn $ISSUED_CERT_ARN
+
+# Download the certificate
+aws acm-pca get-certificate \
+  --certificate-authority-arn $SUB_CA_ARN \
+  --certificate-arn $ISSUED_CERT_ARN \
+  --query 'Certificate' --output text > wildcard.example.com.crt
+
+aws acm-pca get-certificate \
+  --certificate-authority-arn $SUB_CA_ARN \
+  --certificate-arn $ISSUED_CERT_ARN \
+  --query 'CertificateChain' --output text > ca-chain.crt
+
+# Now you have:
+# wildcard.example.com.key  ← Private key (you generated it)
+# wildcard.example.com.crt  ← Signed wildcard cert
+# ca-chain.crt              ← CA chain (subordinate + root)
+```
+
+
+**Summary of Private CA workflow:**
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ ACM Private CA Workflow                                                 │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. Create Root CA    → acm-pca create-certificate-authority (ROOT)    │
+│  2. Self-sign Root    → acm-pca issue-certificate (RootCACertificate)  │
+│  3. Install Root cert → acm-pca import-certificate-authority-certificate│
+│  4. Create Sub CA     → acm-pca create-certificate-authority (SUB)     │
+│  5. Sign Sub CA       → acm-pca issue-certificate (SubordinateCA)      │
+│  6. Install Sub cert  → acm-pca import-certificate-authority-certificate│
+│  7. Issue wildcard    → acm request-certificate (--certificate-authority-arn)│
+│                    OR → acm-pca issue-certificate (with your own CSR)  │
+│                                                                         │
+│  For ALB/CloudFront: Use Method A (acm request-certificate)            │
+│  For EC2/Docker:     Use Method B (acm-pca issue-certificate + own key)│
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Tricky**: ACM Private CA costs $400/month per CA. For cost optimization, use ONE subordinate CA to issue all end-entity certificates. You can deactivate the Root CA after signing the subordinate (reduces to $0 for the root while inactive — you still pay for the subordinate).
+
+**Tricky**: Certificates issued via `acm request-certificate` with a Private CA ARN are managed by ACM (auto-renewal, integrated with ALB/CloudFront) but you CANNOT export the private key. Use `acm-pca issue-certificate` with your own CSR if you need the key for EC2/Docker.
+
+---
+
+
+**Q49: How do you configure Docker containers on ECS with SSL using ALB + ACM (production best practice)?**
+
+**A:**
+
+```bash
+# ============================================
+# PRODUCTION SETUP: ACM + ALB + ECS (Fargate/EC2)
+# This is the RECOMMENDED approach for containerized apps on AWS
+# ============================================
+
+# Step 1: Request ACM certificate (if not done)
+CERT_ARN=$(aws acm request-certificate \
+  --domain-name "*.example.com" \
+  --subject-alternative-names "example.com" \
+  --validation-method DNS \
+  --region us-east-1 \
+  --query 'CertificateArn' --output text)
+
+# Step 2: Create ALB
+ALB_ARN=$(aws elbv2 create-load-balancer \
+  --name my-ecs-alb \
+  --subnets subnet-public-1 subnet-public-2 \
+  --security-groups sg-alb-123 \
+  --scheme internet-facing \
+  --type application \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+
+# Step 3: Create target group (containers listen on HTTP internally)
+TG_ARN=$(aws elbv2 create-target-group \
+  --name my-ecs-tg \
+  --protocol HTTP \
+  --port 80 \
+  --vpc-id vpc-123 \
+  --target-type ip \
+  --health-check-path /health \
+  --health-check-protocol HTTP \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+# Step 4: Create HTTPS listener with ACM cert
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=$CERT_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
+
+# Step 5: HTTP → HTTPS redirect
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions '[{
+    "Type": "redirect",
+    "RedirectConfig": {"Protocol":"HTTPS","Port":"443","StatusCode":"HTTP_301"}
+  }]'
+```
+
+
+```json
+// Step 6: ECS Task Definition (container listens on HTTP — ALB handles TLS)
+{
+  "family": "my-web-app",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::123456789:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "web-app",
+      "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:latest",
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {"name": "PORT", "value": "80"},
+        {"name": "NODE_ENV", "value": "production"}
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:80/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/my-web-app",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
+```
+
+```bash
+# Step 7: Create ECS service
+aws ecs create-service \
+  --cluster my-cluster \
+  --service-name my-web-service \
+  --task-definition my-web-app:1 \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --network-configuration '{
+    "awsvpcConfiguration": {
+      "subnets": ["subnet-private-1", "subnet-private-2"],
+      "securityGroups": ["sg-ecs-tasks"],
+      "assignPublicIp": "DISABLED"
+    }
+  }' \
+  --load-balancers '[{
+    "targetGroupArn": "'$TG_ARN'",
+    "containerName": "web-app",
+    "containerPort": 80
+  }]'
+```
+
+
+**Architecture diagram:**
+```
+Internet Users
+      │
+      ▼ HTTPS (TLS 1.2/1.3)
+┌─────────────────────────────────────────┐
+│ ALB (port 443)                          │
+│ ├── ACM wildcard cert: *.example.com    │
+│ ├── SSL Policy: TLS13-1-2-2021-06      │
+│ ├── HTTP:80 → HTTPS:443 redirect       │
+│ └── Target group: HTTP to containers    │
+└──────────────────┬──────────────────────┘
+                   │ HTTP (plain, internal VPC)
+                   ▼
+┌─────────────────────────────────────────┐
+│ ECS Fargate Tasks (private subnet)      │
+│ ├── Container listens on port 80 (HTTP) │
+│ ├── No TLS config needed in app code    │
+│ ├── X-Forwarded-Proto: https (header)   │
+│ └── Security Group: allow from ALB SG   │
+└─────────────────────────────────────────┘
+```
+
+**Why this is the best practice:**
+```
+Benefits:
+├── Zero certificate management in application code
+├── ACM auto-renewal (never expires)
+├── Free SSL (no cert cost)
+├── Strong TLS policy managed by AWS
+├── Containers remain simple (plain HTTP)
+├── ALB handles SSL offloading (CPU savings in containers)
+├── Easy to add new domains (SNI support, up to 25 certs)
+└── Works with any Docker image (no cert dependencies)
+```
+
+**Tricky**: The container only sees HTTP traffic (X-Forwarded-Proto tells the app the original protocol was HTTPS). If your app does HTTPS redirect checks, use the `X-Forwarded-Proto` header, NOT the connection protocol.
+
+**Tricky**: Security Group for ECS tasks should ONLY allow inbound from the ALB's security group (not 0.0.0.0/0). This ensures containers aren't directly accessible from the internet, even though they run HTTP internally.
+
+---
+
+
+**Q50: Complete end-to-end script: Create CA → Wildcard Cert → Configure on ALB + EC2 + Docker (all-in-one)**
+
+**A:**
+
+```bash
+#!/bin/bash
+# ============================================
+# COMPLETE SCRIPT: CA + Wildcard Cert + Deploy to ALB, EC2, Docker
+# ============================================
+set -e
+
+DOMAIN="example.com"
+REGION="us-east-1"
+ORG="MyCompany"
+
+echo "=========================================="
+echo "PHASE 1: Create Certificate Authority"
+echo "=========================================="
+
+# Create CA directory
+mkdir -p ~/ssl-ca/{private,certs,csr}
+
+# Generate Root CA key
+openssl genrsa -out ~/ssl-ca/private/ca.key 4096
+
+# Generate Root CA cert (10 years)
+openssl req -x509 -new -nodes \
+  -key ~/ssl-ca/private/ca.key \
+  -sha256 -days 3650 \
+  -out ~/ssl-ca/certs/ca.crt \
+  -subj "/C=US/ST=CA/O=${ORG}/CN=${ORG} Root CA"
+
+echo "✓ Root CA created"
+
+echo "=========================================="
+echo "PHASE 2: Create Wildcard Certificate"
+echo "=========================================="
+
+# Generate wildcard cert key
+openssl genrsa -out ~/ssl-ca/private/wildcard.${DOMAIN}.key 2048
+
+# Create SAN config
+cat > /tmp/wildcard.cnf << EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+req_extensions = v3_req
+
+[dn]
+CN = *.${DOMAIN}
+O = ${ORG}
+C = US
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth,clientAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = *.${DOMAIN}
+DNS.2 = ${DOMAIN}
+DNS.3 = *.staging.${DOMAIN}
+EOF
+
+# Generate CSR
+openssl req -new \
+  -key ~/ssl-ca/private/wildcard.${DOMAIN}.key \
+  -out ~/ssl-ca/csr/wildcard.${DOMAIN}.csr \
+  -config /tmp/wildcard.cnf
+
+# Sign with CA
+openssl x509 -req \
+  -in ~/ssl-ca/csr/wildcard.${DOMAIN}.csr \
+  -CA ~/ssl-ca/certs/ca.crt \
+  -CAkey ~/ssl-ca/private/ca.key \
+  -CAcreateserial \
+  -out ~/ssl-ca/certs/wildcard.${DOMAIN}.crt \
+  -days 365 -sha256 \
+  -extensions v3_req -extfile /tmp/wildcard.cnf
+
+# Verify
+openssl verify -CAfile ~/ssl-ca/certs/ca.crt ~/ssl-ca/certs/wildcard.${DOMAIN}.crt
+
+echo "✓ Wildcard certificate created and verified"
+```
+
+
+```bash
+echo "=========================================="
+echo "PHASE 3: Deploy to AWS ALB (import to ACM)"
+echo "=========================================="
+
+# Import cert to ACM
+CERT_ARN=$(aws acm import-certificate \
+  --certificate fileb://~/ssl-ca/certs/wildcard.${DOMAIN}.crt \
+  --private-key fileb://~/ssl-ca/private/wildcard.${DOMAIN}.key \
+  --certificate-chain fileb://~/ssl-ca/certs/ca.crt \
+  --region $REGION \
+  --query 'CertificateArn' --output text)
+
+echo "✓ Certificate imported to ACM: $CERT_ARN"
+
+# Attach to existing ALB listener (update existing HTTPS listener)
+LISTENER_ARN="arn:aws:elasticloadbalancing:${REGION}:123456789:listener/app/my-alb/abc/def"
+
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --certificates CertificateArn=$CERT_ARN \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06
+
+echo "✓ ALB listener updated with new certificate"
+
+echo "=========================================="
+echo "PHASE 4: Deploy to EC2 (Nginx)"
+echo "=========================================="
+
+EC2_HOST="ec2-user@10.0.1.50"
+
+# Copy certs to EC2
+scp ~/ssl-ca/certs/wildcard.${DOMAIN}.crt ${EC2_HOST}:/tmp/
+scp ~/ssl-ca/private/wildcard.${DOMAIN}.key ${EC2_HOST}:/tmp/
+scp ~/ssl-ca/certs/ca.crt ${EC2_HOST}:/tmp/
+
+# Configure Nginx on EC2
+ssh ${EC2_HOST} << 'REMOTE_SCRIPT'
+sudo mkdir -p /etc/nginx/ssl
+sudo mv /tmp/wildcard.*.crt /etc/nginx/ssl/cert.crt
+sudo mv /tmp/wildcard.*.key /etc/nginx/ssl/cert.key
+sudo mv /tmp/ca.crt /etc/nginx/ssl/ca.crt
+sudo chmod 600 /etc/nginx/ssl/cert.key
+sudo chmod 644 /etc/nginx/ssl/cert.crt /etc/nginx/ssl/ca.crt
+
+# Create Nginx SSL config
+sudo tee /etc/nginx/conf.d/ssl.conf > /dev/null << 'NGINX'
+server {
+    listen 443 ssl http2;
+    server_name *.example.com;
+    ssl_certificate /etc/nginx/ssl/cert.crt;
+    ssl_certificate_key /etc/nginx/ssl/cert.key;
+    ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
+    ssl_prefer_server_ciphers on;
+    add_header Strict-Transport-Security "max-age=63072000" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+server {
+    listen 80;
+    server_name *.example.com;
+    return 301 https://$host$request_uri;
+}
+NGINX
+
+sudo nginx -t && sudo nginx -s reload
+REMOTE_SCRIPT
+
+echo "✓ EC2 Nginx configured with SSL"
+```
+
+
+```bash
+echo "=========================================="
+echo "PHASE 5: Deploy to Docker"
+echo "=========================================="
+
+# Create certs directory for Docker
+mkdir -p /opt/docker-certs
+cp ~/ssl-ca/certs/wildcard.${DOMAIN}.crt /opt/docker-certs/cert.crt
+cp ~/ssl-ca/private/wildcard.${DOMAIN}.key /opt/docker-certs/cert.key
+cp ~/ssl-ca/certs/ca.crt /opt/docker-certs/ca.crt
+chmod 600 /opt/docker-certs/cert.key
+
+# Nginx config for Docker
+mkdir -p /opt/docker-nginx
+cat > /opt/docker-nginx/default.conf << 'DOCKERNGINX'
+server {
+    listen 443 ssl http2;
+    server_name *.example.com;
+
+    ssl_certificate /etc/nginx/ssl/cert.crt;
+    ssl_certificate_key /etc/nginx/ssl/cert.key;
+    ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://app:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+server {
+    listen 80;
+    server_name *.example.com;
+    return 301 https://$host$request_uri;
+}
+DOCKERNGINX
+
+# Docker Compose
+cat > /opt/docker-compose.yml << 'COMPOSE'
+version: '3.8'
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - /opt/docker-certs/cert.crt:/etc/nginx/ssl/cert.crt:ro
+      - /opt/docker-certs/cert.key:/etc/nginx/ssl/cert.key:ro
+      - /opt/docker-certs/ca.crt:/etc/nginx/ssl/ca.crt:ro
+      - /opt/docker-nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  app:
+    image: my-app:latest
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+COMPOSE
+
+# Deploy
+cd /opt && docker compose up -d
+
+echo "✓ Docker containers running with SSL"
+
+echo "=========================================="
+echo "DEPLOYMENT COMPLETE!"
+echo "=========================================="
+echo "Certificate: *.${DOMAIN} (valid 365 days)"
+echo "ACM ARN: ${CERT_ARN}"
+echo "ALB: Updated with new cert"
+echo "EC2: Nginx configured on port 443"
+echo "Docker: Running with mounted certs"
+echo ""
+echo "Test commands:"
+echo "  curl -k https://app.${DOMAIN}          (skip CA verify)"
+echo "  curl --cacert ~/ssl-ca/certs/ca.crt https://app.${DOMAIN}  (with CA verify)"
+echo "  openssl s_client -connect app.${DOMAIN}:443 -servername app.${DOMAIN}"
+```
+
+**Quick reference — what goes where:**
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Deployment Target │ Certificate Location  │ Private Key Access │ Method  │
+├───────────────────┼───────────────────────┼────────────────────┼─────────┤
+│ ALB               │ ACM (import or issue) │ ACM manages        │ Easiest │
+│ CloudFront        │ ACM (us-east-1 only)  │ ACM manages        │ Easy    │
+│ NLB (TLS)         │ ACM (import or issue) │ ACM manages        │ Easy    │
+│ EC2 (Nginx)       │ /etc/nginx/ssl/       │ On disk (chmod 600)│ Manual  │
+│ EC2 (Apache)      │ /etc/httpd/ssl/       │ On disk (chmod 600)│ Manual  │
+│ Docker (volume)   │ Mounted via -v        │ Host filesystem    │ Medium  │
+│ Docker (secrets)  │ /run/secrets/         │ Swarm-managed      │ Secure  │
+│ ECS + ALB         │ ACM (on ALB)          │ ACM manages        │ Best    │
+│ ECS (direct TLS)  │ Secrets Manager       │ Fetched at runtime │ Complex │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Tricky**: For internal/private CA certificates, clients must trust your CA root. Distribute `ca.crt` to all clients, or add it to the OS trust store: `sudo cp ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates` (Ubuntu) or `sudo cp ca.crt /etc/pki/ca-trust/source/anchors/ && sudo update-ca-trust` (Amazon Linux/RHEL).

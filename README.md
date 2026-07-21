@@ -22,7 +22,7 @@ A comprehensive collection of **250+ deep-dive interview questions with detailed
 | 14 | Git / Bitbucket CI-CD Pipelines | [Git-CICD-Pipeline.md](./Git-CICD-Pipeline.md) | 12 |
 | 15 | Linux & Windows Servers | [Linux-Windows-Servers.md](./Linux-Windows-Servers.md) | 15 |
 | 16 | AWS CloudWatch Metrics Deep Dive | [AWS-CloudWatch-Metrics-DeepDive.md](./AWS-CloudWatch-Metrics-DeepDive.md) | 25 |
-| 17 | SSL Certificates, CA & AWS Certificate Manager | [SSL-CA-AWS-CertificateManager.md](./SSL-CA-AWS-CertificateManager.md) | 40 |
+| 17 | SSL Certificates, CA & AWS Certificate Manager | [SSL-CA-AWS-CertificateManager.md](./SSL-CA-AWS-CertificateManager.md) | 50 |
 
 ## Key Features
 
