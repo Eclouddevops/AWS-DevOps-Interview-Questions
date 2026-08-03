@@ -1634,3 +1634,279 @@ Time 3: "prod" → Version 2 (100%)
 | API Gateway payload limit | 10 MB | Request/response |
 | Lambda payload (sync) | 6 MB request / 6 MB response | Hard limit |
 | Lambda payload (async) | 256 KB | Event payload limit |
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q61: Your Lambda function processes payment webhooks from Stripe. During Black Friday, you notice 30% of webhook events are being lost — Lambda returns 200 but doesn't process the event. CloudWatch shows no errors. What's happening?**
+
+**A:**
+
+**Root cause investigation:**
+```bash
+# Check Lambda concurrent executions vs throttling
+aws cloudwatch get-metric-statistics --namespace AWS/Lambda \
+  --metric-name Throttles --period 60 --statistics Sum \
+  --dimensions Name=FunctionName,Value=payment-webhook
+
+# Check invocation count vs actual processing
+aws cloudwatch get-metric-statistics --namespace AWS/Lambda \
+  --metric-name Invocations --period 60 --statistics Sum \
+  --dimensions Name=FunctionName,Value=payment-webhook
+```
+
+**The sneaky causes:**
+```
+1. API Gateway TIMEOUT (29 second hard limit):
+   - Lambda takes >29s during peak → API Gateway returns 504 to Stripe
+   - But Lambda CONTINUES running in background
+   - Stripe sees 504 → retries → duplicate processing
+   - Your logs show success (Lambda completed) but Stripe retried = "lost" events
+   
+2. RESERVED CONCURRENCY too low:
+   - Lambda reserved concurrency = 100
+   - Black Friday: 500 concurrent webhooks
+   - 400 get throttled (429) → API GW returns 429 to Stripe
+   - Stripe retries with exponential backoff → events delayed, some expire
+   
+3. COLD START + TIMEOUT:
+   - Lambda cold start: 5s (VPC attached)
+   - Function timeout: 30s
+   - Total processing time: 5s cold start + 27s processing = 32s > 30s timeout
+   - Function killed mid-processing → event lost
+   
+4. IDEMPOTENCY missing:
+   - Stripe sends same event 3 times (retry policy)
+   - Lambda processes all 3 → triple charges (not "lost" but duplicated)
+   - Team thinks events are lost because order count doesn't match
+```
+
+**Production-grade fix:**
+```python
+# Lambda handler with idempotency + async processing
+import boto3
+import json
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+sqs = boto3.client('sqs')
+idempotency_table = dynamodb.Table('webhook-idempotency')
+
+def handler(event, context):
+    body = json.loads(event['body'])
+    event_id = body['id']  # Stripe event ID
+    
+    # Step 1: Check idempotency (prevent duplicate processing)
+    try:
+        idempotency_table.put_item(
+            Item={'event_id': event_id, 'received_at': str(datetime.now()), 'ttl': int(datetime.now().timestamp()) + 86400},
+            ConditionExpression='attribute_not_exists(event_id)'
+        )
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        # Already processed — return 200 to stop Stripe retrying
+        return {'statusCode': 200, 'body': 'Already processed'}
+    
+    # Step 2: Queue for async processing (respond to Stripe immediately)
+    sqs.send_message(
+        QueueUrl='https://sqs.../payment-webhook-queue',
+        MessageBody=json.dumps(body),
+        MessageGroupId=body.get('data', {}).get('object', {}).get('customer', 'default')
+    )
+    
+    # Step 3: Return 200 FAST (within 3 seconds)
+    return {'statusCode': 200, 'body': 'Accepted'}
+```
+
+**Architecture for zero-loss webhooks:**
+```
+Stripe → API Gateway → Lambda (fast acknowledgment, <3s)
+                              ↓ writes to SQS
+                         SQS FIFO Queue (retry built-in)
+                              ↓ triggers
+                         Processing Lambda (takes 30s+, can retry)
+                              ↓
+                         Payment Service / Database
+```
+
+**Tricky**: API Gateway has a HARD 29-second timeout that cannot be increased. If your webhook processing takes longer, you MUST use async processing: acknowledge immediately (return 200), queue the event (SQS/EventBridge), process asynchronously. Also, Lambda's `context.getRemainingTimeInMillis()` can be used to detect when you're about to timeout and push remaining work to a queue before getting killed.
+
+---
+
+**Q62: Your API Gateway + Lambda architecture works perfectly at 100 req/s but completely falls over at 1000 req/s. Lambda concurrency limit is 3000 (plenty). No throttling in CloudWatch. What's the bottleneck?**
+
+**A:**
+
+**Hidden bottlenecks (not Lambda itself):**
+```
+1. API Gateway ACCOUNT-LEVEL throttle:
+   - Default: 10,000 requests/second (across ALL APIs in region)
+   - If you have 20 APIs, they SHARE this limit
+   - One noisy API consuming 9500 → your API only gets 500
+   - Fix: Request limit increase OR use usage plans
+
+2. Lambda BURST concurrency limit:
+   - Initial burst: 500-3000 (region dependent)
+   - After burst: scales 500 additional instances/minute
+   - If you go from 100 to 1000 in 1 second → only 500 concurrent → rest throttled
+   - Fix: Use Provisioned Concurrency for predictable peaks
+
+3. VPC ENI creation bottleneck:
+   - Lambda in VPC needs ENIs for each execution environment
+   - Creating ENI: 10-30 seconds
+   - 900 new environments needed = 900 ENIs = massive cold start storm
+   - Fix: Use VPC with pre-provisioned ENIs (SnapStart for Java, Provisioned Concurrency)
+
+4. DOWNSTREAM dependency (most common):
+   - Lambda calls RDS with max_connections = 100
+   - At 1000 req/s: 1000 Lambda instances × 1 DB connection each = needs 1000 connections
+   - RDS can only handle 100 → connection refused → Lambda errors
+   - Fix: Use RDS Proxy (connection pooling)
+```
+
+**RDS Proxy solution:**
+```bash
+# Create RDS Proxy for connection pooling
+aws rds create-db-proxy --db-proxy-name lambda-proxy \
+  --engine-family POSTGRESQL \
+  --auth '[{"AuthScheme":"SECRETS","SecretArn":"arn:aws:secretsmanager:...:secret:db-creds","IAMAuth":"REQUIRED"}]' \
+  --role-arn arn:aws:iam::123456:role/rds-proxy-role \
+  --vpc-subnet-ids subnet-a subnet-b
+
+# Lambda connects to proxy endpoint (not directly to RDS)
+# Proxy: accepts 1000+ connections from Lambda
+# Proxy → RDS: maintains pool of 50-100 connections
+# Result: 1000 Lambda instances share 100 DB connections efficiently
+```
+
+**API Gateway throttling configuration:**
+```bash
+# Per-method throttling
+aws apigateway update-stage --rest-api-id abc123 --stage-name prod \
+  --patch-operations '[
+    {"op":"replace","path":"/*/POST/throttling/rateLimit","value":"5000"},
+    {"op":"replace","path":"/*/POST/throttling/burstLimit","value":"2500"}
+  ]'
+
+# Usage plan for rate limiting by client
+aws apigateway create-usage-plan --name "premium" \
+  --throttle burstLimit=1000,rateLimit=500 \
+  --quota limit=100000,period=MONTH
+```
+
+**Tricky**: Lambda scales CONCURRENCY, not throughput. If each Lambda takes 1 second, then 1000 req/s needs 1000 concurrent executions. If each takes 100ms, you only need 100 concurrent. The fastest way to handle more traffic is to make each Lambda faster (optimize code, reduce cold starts) rather than increasing concurrency limits. Also, DynamoDB is the ideal backend for Lambda at scale — no connection limit, scales automatically. RDS is Lambda's worst friend without RDS Proxy.
+
+---
+
+**Q63: Your WAF rule is blocking legitimate customers. 5% of real users get 403 Forbidden. You can see the WAF logs show "RateBasedRule" triggered. But these are normal users browsing your site. How do you fix this without disabling rate limiting entirely?**
+
+**A:**
+
+**Diagnosis:**
+```bash
+# Check WAF logs for blocked requests
+aws wafv2 get-sampled-requests --web-acl-arn arn:aws:wafv2:...:webacl/prod \
+  --rule-metric-name RateBasedRule --scope REGIONAL \
+  --time-window StartTime=$(date -d '1 hour ago' --iso-8601),EndTime=$(date --iso-8601) \
+  --max-items 100
+
+# Analyze: Are blocked IPs real users or bots?
+# Look at: User-Agent, country, request patterns
+```
+
+**Why legitimate users trigger rate limiting:**
+```
+1. CORPORATE NAT/PROXY:
+   - 500 employees behind one corporate IP
+   - Each browses 5 pages/min = 2500 req/min from ONE IP
+   - Rate limit: 2000 req/5min per IP → BLOCKED!
+   - Entire office loses access
+
+2. MOBILE CARRIER NAT (CGNAT):
+   - Millions of mobile users share a few IPs
+   - Rate limit per IP blocks thousands of real users
+   
+3. CDN/PROXY FORWARDING:
+   - CloudFront forwards all requests from a few IPs
+   - WAF sees CloudFront IPs, not real client IPs
+   - Rate limit triggers on CloudFront IPs → blocks everyone
+
+4. SINGLE-PAGE APP (SPA):
+   - React app makes 20 API calls on page load
+   - User navigates 10 pages = 200 requests in 2 minutes
+   - Rate limit: 100 req/min → legitimate user blocked
+```
+
+**Fix without disabling rate limiting:**
+```json
+{
+  "Name": "SmartRateLimit",
+  "Statement": {
+    "RateBasedStatement": {
+      "Limit": 2000,
+      "AggregateKeyType": "FORWARDED_IP",
+      "ForwardedIPConfig": {
+        "HeaderName": "X-Forwarded-For",
+        "FallbackBehavior": "MATCH"
+      },
+      "ScopeDownStatement": {
+        "NotStatement": {
+          "Statement": {
+            "IPSetReferenceStatement": {
+              "ARN": "arn:aws:wafv2:...:ipset/corporate-allowlist"
+            }
+          }
+        }
+      }
+    }
+  },
+  "Action": { "Block": {} },
+  "VisibilityConfig": {
+    "SampledRequestsEnabled": true,
+    "CloudWatchMetricsEnabled": true,
+    "MetricName": "SmartRateLimit"
+  }
+}
+```
+
+**Multi-layer rate limiting strategy:**
+```
+Layer 1: IP-based (generous limit: 5000 req/5min)
+  → Catches obvious bots and scrapers
+
+Layer 2: IP + URI pattern (stricter for sensitive endpoints)
+  → /api/login: 10 req/min per IP
+  → /api/checkout: 5 req/min per IP
+  → /api/products: 1000 req/min per IP (browsing is OK)
+
+Layer 3: Token-based (for authenticated users)
+  → Rate limit by auth token, not IP
+  → Authenticated users get higher limits
+  → Unauthenticated traffic gets IP-based limits
+
+Layer 4: Behavioral detection (advanced)
+  → Block if: same User-Agent + sequential URL patterns
+  → Block if: no JavaScript execution (headless bot)
+  → Challenge if: suspicious but not conclusive
+```
+
+**Better approach — CAPTCHA instead of block:**
+```json
+{
+  "Action": {
+    "Captcha": {
+      "CustomRequestHandling": {
+        "InsertHeaders": [{"Name": "x-waf-action", "Value": "captcha"}]
+      }
+    }
+  }
+}
+```
+
+**Tricky**: When WAF is behind CloudFront, you MUST use `X-Forwarded-For` for rate limiting (not source IP). Otherwise WAF sees CloudFront's IPs and rate-limits CloudFront itself — blocking ALL users. Use `FORWARDED_IP` aggregate key type with proper header configuration. Also, WAF rate-based rules evaluate over a 5-minute sliding window and take 30-60 seconds to trigger. During that delay, an attacker can send thousands of requests. For instant protection, combine rate-based rules with IP reputation lists (AWS Managed Rules).
+
+---

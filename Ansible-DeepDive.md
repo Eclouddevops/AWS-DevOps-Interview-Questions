@@ -859,3 +859,238 @@ namespace.collection_name
 ```
 
 **Tricky**: Since Ansible 2.10, most modules moved from "built-in" to collections. A playbook that worked on 2.9 may fail on newer versions without installing the correct collection. Always pin collection versions in `requirements.yml`!
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q21: Your Ansible playbook runs successfully on 95% of servers but fails on 5% with "unreachable" errors. All servers are in the same subnet and you can SSH to them manually. What's happening?**
+
+**A:**
+
+**Diagnosis:**
+```bash
+# Run with verbose to see SSH details
+ansible all -m ping -vvvv 2>&1 | grep -A5 "UNREACHABLE"
+
+# Common output:
+# "Failed to connect to the host via ssh: Connection timed out"
+# "Failed to connect to the host via ssh: Permission denied (publickey)"
+# "Failed to connect to the host via ssh: No route to host"
+```
+
+**Causes and fixes:**
+```
+1. SSH CONNECTION LIMIT on target hosts:
+   - /etc/ssh/sshd_config: MaxSessions=10, MaxStartups=10:30:60
+   - Ansible opens many parallel connections (default forks=5)
+   - With 100 servers and forks=20 → 20 simultaneous SSH connections
+   - Some servers already have 8 sessions → MaxSessions exceeded
+   - Fix: Increase MaxStartups or reduce Ansible forks
+
+2. DNS RESOLUTION TIMEOUT:
+   - Ansible resolves hostnames on each connection
+   - 5% of servers have reverse DNS entries pointing to stale records
+   - SSH does reverse lookup → times out
+   - Fix: ansible.cfg: [ssh_connection] ssh_args = -o UseDNS=no
+
+3. HOST KEY CHANGED (after server rebuild):
+   - Server was rebuilt but kept same IP
+   - known_hosts has old host key → SSH refuses to connect
+   - Fix: ansible.cfg: host_key_checking = False (for dynamic infra)
+   - Better: StrictHostKeyChecking=accept-new (accept first time only)
+
+4. CONTROL PERSIST SOCKET STALE:
+   - ControlMaster sockets from previous run in /tmp
+   - Stale socket prevents new connection
+   - Fix: ssh_args = -o ControlPersist=60s -o ControlPath=/tmp/ansible-%r@%h:%p
+
+5. SELINUX / FIREWALL INTERMITTENT:
+   - firewalld or iptables rate limiting SSH connections
+   - 5% fail because they hit the rate limit threshold
+   - Fix: Check conntrack limits and firewall rules on failing hosts
+```
+
+**Ansible SSH optimization:**
+```ini
+# ansible.cfg
+[ssh_connection]
+pipelining = True              # Reduces SSH operations (HUGE speedup)
+ssh_args = -o ControlMaster=auto -o ControlPersist=300s -o PreferredAuthentications=publickey
+retries = 3                    # Retry unreachable hosts
+timeout = 30                   # Connection timeout
+
+[defaults]
+forks = 20                     # Parallel connections (balance speed vs target load)
+gathering = smart              # Cache facts, don't regather
+fact_caching = jsonfile
+fact_caching_connection = /tmp/ansible_facts_cache
+fact_caching_timeout = 3600
+```
+
+**Tricky**: `pipelining = True` is the single biggest Ansible performance win (2-5x faster) but it ONLY works if `requiretty` is disabled in `/etc/sudoers` on the target hosts. If you enable pipelining and some hosts have `requiretty`, those hosts will fail with cryptic errors. Check: `grep requiretty /etc/sudoers` on failing hosts. Fix: `Defaults !requiretty` in sudoers.
+
+---
+
+**Q22: You're managing 500 servers with Ansible. A playbook change needs to go to all servers but you can't afford downtime if it fails. How do you safely roll out changes with Ansible's serial execution?**
+
+**A:**
+
+**Progressive rollout strategy:**
+```yaml
+# Canary → Small batch → Full rollout with automatic rollback
+
+- hosts: webservers
+  serial:
+    - 1           # First: single canary server
+    - 5           # Then: small batch (5 servers)
+    - "10%"       # Then: 10% at a time
+    - "25%"       # Then: 25% at a time
+    - "100%"      # Finally: all remaining
+  max_fail_percentage: 5   # Stop if >5% of batch fails
+
+  pre_tasks:
+    - name: Health check before changes
+      uri:
+        url: "http://{{ inventory_hostname }}:8080/health"
+        status_code: 200
+      register: pre_health
+
+  tasks:
+    - name: Deploy new configuration
+      template:
+        src: app.conf.j2
+        dest: /etc/app/app.conf
+      notify: restart_app
+
+    - name: Wait for service to be healthy after change
+      uri:
+        url: "http://{{ inventory_hostname }}:8080/health"
+        status_code: 200
+      retries: 10
+      delay: 5
+      register: post_health
+
+  post_tasks:
+    - name: Validate application functionality
+      uri:
+        url: "http://{{ inventory_hostname }}:8080/api/v1/status"
+        status_code: 200
+        return_content: yes
+      register: api_response
+      failed_when: "'healthy' not in api_response.content"
+
+    - name: Notify monitoring of deployment progress
+      uri:
+        url: "https://slack.webhook.url"
+        method: POST
+        body_format: json
+        body:
+          text: "Deployed to {{ ansible_play_batch | length }} servers. Remaining: {{ ansible_play_hosts_all | length - ansible_play_batch | length }}"
+
+  handlers:
+    - name: restart_app
+      service:
+        name: myapp
+        state: restarted
+```
+
+**Automatic rollback on failure:**
+```yaml
+  rescue:
+    - name: Rollback — restore previous config
+      copy:
+        src: /etc/app/app.conf.bak
+        dest: /etc/app/app.conf
+        remote_src: yes
+
+    - name: Restart with old config
+      service:
+        name: myapp
+        state: restarted
+
+    - name: Alert team of rollback
+      uri:
+        url: "https://pagerduty.webhook.url"
+        method: POST
+        body_format: json
+        body:
+          routing_key: "abc123"
+          event_action: "trigger"
+          payload:
+            summary: "Ansible rollback triggered on {{ inventory_hostname }}"
+            severity: "critical"
+```
+
+**Tricky**: `max_fail_percentage` applies PER BATCH, not total. With `serial: 50` and `max_fail_percentage: 10` on 500 servers: if 5 out of 50 fail in the first batch (10%), Ansible STOPS. But if only 4 fail per batch (8%), it continues — potentially leaving 40+ servers in a broken state across 10 batches. For critical infrastructure, use `serial: 1` for the first few, then increase. Also, `any_errors_fatal: true` stops the ENTIRE play on the first failure — nuclear option but safest.
+
+---
+
+**Q23: Your Ansible vault password is stored in a file on the control node. A security audit found that 15 engineers have access to this file. How do you implement proper secrets management for Ansible in production?**
+
+**A:**
+
+**Current (insecure) setup:**
+```bash
+# Password stored in plaintext file readable by team
+cat ~/.vault_password  # "SuperSecretP@ss!"
+ansible-playbook site.yml --vault-password-file ~/.vault_password
+# Problem: Anyone on the control node can decrypt ALL vault secrets
+```
+
+**Production-grade secrets management:**
+
+```bash
+# Option 1: Vault password from external secrets manager (recommended)
+# ansible.cfg:
+[defaults]
+vault_password_file = /scripts/get-vault-password.sh
+
+# /scripts/get-vault-password.sh:
+#!/bin/bash
+# Fetch from AWS Secrets Manager (requires IAM role, not stored locally)
+aws secretsmanager get-secret-value \
+  --secret-id ansible-vault-password \
+  --query SecretString --output text
+
+# Option 2: HashiCorp Vault integration (best for enterprises)
+# Use ansible-vault with lookup plugin:
+# In playbook (no vault-encrypted files needed):
+- name: Get database password
+  set_fact:
+    db_password: "{{ lookup('hashi_vault', 'secret/data/production/db:password') }}"
+
+# Option 3: Multiple vault IDs (different passwords per environment)
+# Encrypt prod secrets with prod password, dev with dev password
+ansible-vault encrypt_string --vault-id prod@prompt 'realpassword' --name 'db_pass'
+ansible-vault encrypt_string --vault-id dev@prompt 'devpassword' --name 'db_pass'
+
+# Run with correct vault ID:
+ansible-playbook site.yml --vault-id prod@/scripts/get-prod-password.sh --vault-id dev@/scripts/get-dev-password.sh
+```
+
+**Best practice — don't use Ansible Vault for secrets at all:**
+```yaml
+# Instead of encrypting secrets IN playbooks/vars files,
+# fetch them at runtime from external secret store:
+
+- name: Fetch secrets from AWS Secrets Manager
+  set_fact:
+    app_secrets: "{{ lookup('aws_ssm', '/production/myapp/', bypath=true) }}"
+  no_log: true  # CRITICAL: Don't log secret values!
+
+- name: Template config with secrets
+  template:
+    src: app.conf.j2
+    dest: /etc/app/app.conf
+    mode: '0600'
+  no_log: true
+```
+
+**Tricky**: `no_log: true` is essential for any task that handles secrets. Without it, Ansible prints secret values in stdout and logs. But `no_log: true` also hides ERROR messages, making debugging impossible. The compromise: use `no_log: "{{ not ansible_check_mode }}"` — secrets are hidden in real runs but visible in check mode (which doesn't actually execute anything). Also, Ansible facts are cached — if you `set_fact` a secret, it may persist in the fact cache on disk. Always set `fact_caching_timeout` low or exclude secret facts from caching.
+
+---

@@ -579,3 +579,186 @@ result = s3.select_object_content(
 ```
 
 **Tricky**: S3 Select works on a SINGLE object. For querying across thousands of objects, use Athena. S3 Select is ideal when your application needs specific rows from a known file (e.g., Lambda processing individual files from S3 events).
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q16: Your S3 bucket receives 50,000 PUT requests per second during peak hours. Performance is fine for 95% of requests, but 5% get HTTP 503 "Slow Down" errors. How do you fix this?**
+
+**A:**
+
+**Understanding S3 partitioning:**
+```
+S3 partitions data by key PREFIX for performance.
+Each partition handles: 3,500 PUT/POST/DELETE + 5,500 GET/HEAD per second.
+
+If all 50,000 objects have similar prefix:
+  logs/2024/01/20/event-001.json
+  logs/2024/01/20/event-002.json
+  → All go to same partition → throttled!
+
+S3 uses the FIRST characters of the key for partitioning.
+Identical prefix = same partition = performance bottleneck.
+```
+
+**Fix strategies:**
+```bash
+# Strategy 1: Add randomized prefix (classic approach)
+# BEFORE: logs/2024/01/20/event-001.json
+# AFTER:  a3f2/logs/2024/01/20/event-001.json
+#         7b1c/logs/2024/01/20/event-001.json
+# Random 4-char hex prefix = 65,536 possible partitions!
+
+# In code:
+import hashlib
+def get_s3_key(original_key):
+    prefix = hashlib.md5(original_key.encode()).hexdigest()[:4]
+    return f"{prefix}/{original_key}"
+
+# Strategy 2: Reverse the timestamp (better for time-series)
+# BEFORE: 2024-01-20-15-30-45/event.json (all same prefix during same second)
+# AFTER:  54-03-51-02-10-4202/event.json (reversed = distributed)
+
+# Strategy 3: Use date-based partitioning with hour/minute
+# logs/2024/01/20/15/30/event-001.json
+# Spreads across time-based partitions
+
+# Strategy 4: S3 auto-scaling (modern approach — just wait)
+# Since 2018, S3 automatically scales partitions based on access patterns
+# But it takes 15-30 minutes to adapt to sudden spikes
+# For predictable spikes: send dummy requests to "warm" prefixes beforehand
+```
+
+**Tricky**: Since 2018, S3 automatically repartitions based on request patterns — you no longer NEED random prefixes for most workloads. But the auto-scaling takes time (15-30 minutes). If your traffic goes from 0 to 50K/s instantly (batch job starts), you'll hit 503s during the ramp-up period. Solution: gradually increase request rate over 15 minutes, or pre-warm the prefix by sending a few thousand requests in advance. Also, S3 Intelligent Tiering and lifecycle transitions generate internal LIST/HEAD operations that count toward your partition limits.
+
+---
+
+**Q17: A developer accidentally enabled versioning on a 100TB bucket. After 6 months, the bucket is now 400TB (300TB of old versions). Storage costs quadrupled. How do you clean this up without affecting current data?**
+
+**A:**
+
+**Understanding the problem:**
+```
+Versioning = every overwrite/delete creates a new version
+Original file: 1MB → overwritten 3 times = 4 versions = 4MB stored
+
+For a log bucket with daily rotation:
+- 100TB current data
+- Each file overwritten daily for 6 months = ~180 versions per file
+- But files are also deleted → "delete markers" stored (zero-size but count as objects)
+- 300TB of old versions accumulating daily
+```
+
+**Cleanup approach:**
+```bash
+# Step 1: Analyze version distribution
+aws s3api list-object-versions --bucket my-bucket --prefix "logs/" --max-items 100 \
+  --query 'Versions[].{Key:Key,VersionId:VersionId,IsLatest:IsLatest,LastModified:LastModified,Size:Size}'
+
+# Step 2: Create lifecycle rule to expire old versions
+aws s3api put-bucket-lifecycle-configuration --bucket my-bucket \
+  --lifecycle-configuration '{
+    "Rules": [{
+      "ID": "expire-old-versions",
+      "Status": "Enabled",
+      "Filter": {"Prefix": ""},
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 7,
+        "NewerNoncurrentVersions": 1
+      },
+      "ExpiredObjectDeleteMarker": true
+    }]
+  }'
+# This keeps: current version + 1 previous version
+# Deletes: all versions older than 7 days (except 1 backup)
+# Also cleans up expired delete markers (free space)
+
+# Step 3: For IMMEDIATE cleanup (lifecycle takes up to 48 hours)
+# Use S3 Batch Operations for bulk delete of old versions:
+aws s3api create-job --account-id 123456 --operation '{
+  "S3DeleteObjectTagging": {}
+}' --manifest '...' --report '...'
+
+# Or use a script with pagination:
+aws s3api list-object-versions --bucket my-bucket --key-marker "" \
+  --query 'Versions[?IsLatest==`false`].{Key:Key,VersionId:VersionId}' | \
+  jq -c '.[]' | while read obj; do
+    KEY=$(echo $obj | jq -r '.Key')
+    VID=$(echo $obj | jq -r '.VersionId')
+    aws s3api delete-object --bucket my-bucket --key "$KEY" --version-id "$VID"
+  done
+```
+
+**Cost impact:**
+```
+Before cleanup: 400TB × $0.023/GB = $9,200/month
+After cleanup:  100TB × $0.023/GB = $2,300/month (+ 1 version backup)
+Savings: $6,900/month ($82,800/year!)
+```
+
+**Tricky**: Disabling versioning does NOT delete existing versions — it only stops creating new ones. You must explicitly delete old versions using lifecycle rules or batch operations. Also, `NoncurrentVersionExpiration` with `NewerNoncurrentVersions: 1` keeps exactly 1 previous version as backup. If you set `NoncurrentDays: 1` without `NewerNoncurrentVersions`, you lose ALL backup versions after 1 day — no safety net for accidental deletions. Always keep at least 1 noncurrent version.
+
+---
+
+**Q18: Your application generates 10 million small files (1-10KB each) per day in S3. LIST operations are extremely slow (30+ seconds for 1000 files). How do you optimize S3 for millions of small objects?**
+
+**A:**
+
+**Why small files are problematic:**
+```
+S3 charges per REQUEST, not just storage:
+- PUT: $0.005 per 1,000 requests
+- GET: $0.0004 per 1,000 requests
+- LIST: $0.005 per 1,000 requests
+
+10M files/day:
+- PUT cost: 10,000 × $0.005 = $50/day = $1,500/month (just for writes!)
+- LIST to find files: slow and expensive
+- Transitioning to Glacier: S3 has 128KB minimum charge per object
+  1KB file in Glacier charged as 128KB = 128x more expensive!
+```
+
+**Optimization strategies:**
+```bash
+# Strategy 1: Aggregate small files into larger objects
+# Instead of: 10M × 5KB files = 50GB of tiny files
+# Create: 500 × 100MB aggregate files (batch every minute)
+
+# Using Kinesis Firehose for automatic batching:
+aws firehose create-delivery-stream --delivery-stream-name log-aggregator \
+  --s3-destination-configuration '{
+    "BucketARN": "arn:aws:s3:::my-bucket",
+    "Prefix": "aggregated/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/",
+    "BufferingHints": {
+      "SizeInMBs": 128,
+      "IntervalInSeconds": 300
+    },
+    "CompressionFormat": "GZIP"
+  }'
+# Result: 128MB compressed files every 5 min instead of millions of tiny files
+
+# Strategy 2: Use S3 Inventory instead of LIST
+aws s3api put-bucket-inventory-configuration --bucket my-bucket \
+  --id daily-inventory --inventory-configuration '{
+    "Destination": {"S3BucketDestination": {"Bucket": "arn:aws:s3:::inventory-bucket", "Format": "CSV"}},
+    "IsEnabled": true,
+    "Id": "daily-inventory",
+    "IncludedObjectVersions": "Current",
+    "Schedule": {"Frequency": "Daily"}
+  }'
+# Inventory generates a manifest file — much faster than LIST for bulk operations
+
+# Strategy 3: Partition prefix strategy for fast LIST
+# BEFORE: events/event-uuid-1.json (millions in one prefix)
+# AFTER:  events/2024/01/20/15/event-uuid-1.json (time-partitioned)
+# LIST with prefix "events/2024/01/20/15/" returns only ~7,000 files (fast!)
+```
+
+**Tricky**: S3 LIST is paginated at 1,000 objects per request. To list 10 million objects: 10,000 sequential API calls (each taking 100-500ms) = 15-80 minutes! There's no parallel LIST — each page requires the marker from the previous page. S3 Inventory (delivered as CSV/Parquet daily) is the only practical way to enumerate millions of objects. Also, for Glacier transitions: objects smaller than 128KB are charged as 128KB for storage. A 1KB file costs 128x more in Glacier than Standard. ALWAYS aggregate small files before lifecycle transitions.
+
+---

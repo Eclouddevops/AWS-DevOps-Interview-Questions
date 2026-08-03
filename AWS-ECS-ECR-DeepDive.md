@@ -405,3 +405,212 @@ With Capacity Providers:
 - KMS decrypt permission if secrets are KMS-encrypted
 
 **Tricky**: Secrets are injected at task LAUNCH time. If you rotate a secret, running tasks still have the OLD value. Must redeploy (force new deployment) to pick up new secrets. Use Secrets Manager rotation Lambda + ECS deployment trigger for automatic refresh.
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q11: Your ECS Fargate task starts and immediately exits with "CannotPullContainerError." ECR image exists and you can pull it locally. The task ran fine yesterday. What changed?**
+
+**A:**
+
+**Common causes (ordered by frequency):**
+```
+1. VPC ENDPOINT OR NAT GATEWAY ISSUE:
+   - Fargate tasks in private subnet need NAT GW or VPC endpoints to reach ECR
+   - NAT GW was deleted/misconfigured
+   - Or: VPC endpoint for ECR was removed
+   
+2. ECR REPOSITORY POLICY CHANGED:
+   - Someone modified the ECR repo policy → task role no longer has pull access
+   - Or: cross-account pull permission revoked
+
+3. IMAGE TAG OVERWRITTEN WITH BROKEN IMAGE:
+   - Someone pushed a new image with same tag (:latest or :v1.2.3)
+   - New image is corrupt or wrong architecture (amd64 vs arm64)
+
+4. ECR LIFECYCLE POLICY DELETED THE IMAGE:
+   - Lifecycle rule: "keep only last 10 images"
+   - 11th image pushed → old tag deleted
+   - Task definition references deleted tag
+
+5. STS TOKEN EXPIRED (cross-account):
+   - Task role assumes cross-account role to pull from ECR in another account
+   - Role trust policy changed → AssumeRole fails → can't authenticate to ECR
+```
+
+**Debugging:**
+```bash
+# Check stopped task details
+aws ecs describe-tasks --cluster prod --tasks <task-arn> \
+  --query 'tasks[].containers[].{reason:reason,lastStatus:lastStatus}'
+
+# Check if image exists in ECR
+aws ecr describe-images --repository-name myapp --image-ids imageTag=v1.2.3
+
+# Check task execution role permissions
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::123456:role/ecsTaskExecutionRole \
+  --action-names ecr:GetAuthorizationToken ecr:GetDownloadUrlForLayer ecr:BatchGetImage
+
+# Check VPC endpoint / NAT connectivity
+# For private subnets, you need EITHER:
+# - NAT Gateway (route 0.0.0.0/0 → nat-gw)
+# - VPC endpoints for: ecr.api, ecr.dkr, AND s3 (ECR uses S3 for layers!)
+aws ec2 describe-vpc-endpoints --filters Name=service-name,Values=com.amazonaws.us-east-1.ecr.dkr
+```
+
+**Fix:**
+```bash
+# Create required VPC endpoints for private Fargate tasks
+aws ec2 create-vpc-endpoint --vpc-id vpc-xxx \
+  --service-name com.amazonaws.us-east-1.ecr.api --vpc-endpoint-type Interface \
+  --subnet-ids subnet-a subnet-b --security-group-ids sg-xxx
+
+aws ec2 create-vpc-endpoint --vpc-id vpc-xxx \
+  --service-name com.amazonaws.us-east-1.ecr.dkr --vpc-endpoint-type Interface \
+  --subnet-ids subnet-a subnet-b --security-group-ids sg-xxx
+
+# Don't forget S3 endpoint (ECR layers stored in S3!)
+aws ec2 create-vpc-endpoint --vpc-id vpc-xxx \
+  --service-name com.amazonaws.us-east-1.s3 --vpc-endpoint-type Gateway \
+  --route-table-ids rtb-private
+```
+
+**Tricky**: ECR stores image layers in S3. When Fargate pulls an image, it authenticates with ECR (ecr.dkr endpoint) then downloads layers from S3. If you create VPC endpoints for ECR but forget the S3 Gateway Endpoint, pulls will PARTIALLY work (auth succeeds) but then TIMEOUT downloading layers. The error message is unhelpful: "CannotPullContainerError: context deadline exceeded." Always create all three endpoints: ecr.api, ecr.dkr, AND s3.
+
+---
+
+**Q12: Your ECS service keeps cycling between RUNNING and STOPPED states. Task starts, runs for 30 seconds, then stops. ECS launches a new task, same thing happens. Container logs show the application starting successfully. What's killing it?**
+
+**A:**
+
+**Investigation:**
+```bash
+# Check stopped task reason
+aws ecs describe-tasks --cluster prod --tasks $(aws ecs list-tasks --cluster prod \
+  --service-name myservice --desired-status STOPPED --query 'taskArns[0]' --output text) \
+  --query 'tasks[].{stopCode:stopCode,stoppedReason:stoppedReason,containers:containers[].{exitCode:exitCode,reason:reason}}'
+
+# Common stoppedReason values:
+# "Essential container in task exited" → container crashed
+# "Task failed ELB health checks" → ALB health check failed
+# "Scaling activity initiated by..." → desired count reduced
+# "DAEMON task stopped" → daemon service constraints
+```
+
+**The "app starts fine but dies after 30s" causes:**
+```
+1. ALB HEALTH CHECK FAILING:
+   - Task starts → registers with target group → health check begins
+   - Health check path: /health (returns 200 locally)
+   - But in ECS: app listens on port 8080, health check configured for port 80
+   - 30 seconds = health check timeout → ALB marks unhealthy → ECS stops task
+   
+2. CONTAINER HEALTH CHECK FAILING:
+   - Task definition has healthCheck configured
+   - Command: ["CMD-SHELL", "curl -f http://localhost:8080/health"]
+   - But container doesn't have curl installed! → health check always fails
+   - After startPeriod + (retries × interval) = task marked unhealthy
+
+3. GRACEFUL SHUTDOWN SIGNAL HANDLING:
+   - ECS sends SIGTERM when stopping tasks
+   - App doesn't handle SIGTERM → doesn't shut down within stopTimeout (30s)
+   - ECS sends SIGKILL → exit code 137
+   - ECS replaces task → same cycle
+
+4. RESOURCE LIMITS:
+   - Memory limit: 512MB
+   - App uses 512MB at startup then spikes to 520MB → OOMKilled
+   - Exit code: 137 (SIGKILL from OOM)
+```
+
+**Fix for health check issues:**
+```json
+// Task definition — proper health check configuration
+{
+  "healthCheck": {
+    "command": ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1"],
+    "interval": 10,
+    "timeout": 5,
+    "retries": 3,
+    "startPeriod": 60
+  }
+}
+// startPeriod: 60 = give app 60 seconds to start before health checks begin
+// Use wget instead of curl (alpine images have wget but not curl)
+```
+
+**Tricky**: ECS health check and ALB health check are SEPARATE. If BOTH are configured, EITHER can kill your task. ECS container health check failure → task marked UNHEALTHY → service scheduler replaces it. ALB health check failure → target deregistered → ECS sees it and may replace. Disable one of them to avoid double-kill scenarios. Best practice: use ALB health check only (set `healthCheck` in task definition to null) and configure ALB health check with generous `HealthyThresholdCount` and `HealthCheckGracePeriodSeconds` on the ECS service.
+
+---
+
+**Q13: You need to deploy a new ECS service version with zero downtime. The new version requires a database migration that takes 2 minutes. During migration, the old version must continue serving traffic. How do you orchestrate this?**
+
+**A:**
+
+**Blue-Green deployment with migration:**
+```
+Timeline:
+T0: Old version (v1) serving traffic ✓
+T1: Run database migration (backward-compatible)
+T2: Deploy new version (v2) alongside v1
+T3: Health checks pass on v2
+T4: Shift traffic from v1 → v2
+T5: Drain v1 (deregistration delay)
+T6: Stop v1 tasks
+```
+
+**Implementation with ECS + CodeDeploy Blue/Green:**
+```bash
+# Step 1: Migration must be BACKWARD COMPATIBLE
+# v1 must still work after migration runs (expand-contract pattern)
+# Migration adds new columns, doesn't remove/rename old ones
+
+# Step 2: ECS Blue/Green deployment
+aws deploy create-deployment --application-name myapp \
+  --deployment-group-name prod-bg \
+  --revision '{
+    "revisionType": "AppSpecContent",
+    "appSpecContent": {
+      "content": "{\"version\":1,\"Resources\":[{\"TargetService\":{\"Type\":\"AWS::ECS::Service\",\"Properties\":{\"TaskDefinition\":\"arn:aws:ecs:...:task-definition/myapp:42\",\"LoadBalancerInfo\":{\"ContainerName\":\"myapp\",\"ContainerPort\":8080}}}}],\"Hooks\":[{\"BeforeAllowTraffic\":\"arn:aws:lambda:...:function:run-migration\"},{\"AfterAllowTraffic\":\"arn:aws:lambda:...:function:smoke-test\"}]}"
+    }
+  }'
+
+# CodeDeploy lifecycle hooks:
+# BeforeInstall: (create new task set)
+# AfterInstall: (new tasks running, not receiving traffic)
+# BeforeAllowTraffic: RUN MIGRATION HERE ← Lambda runs DB migration
+# AllowTraffic: (shift traffic to new tasks)
+# AfterAllowTraffic: RUN SMOKE TESTS ← Lambda verifies new version works
+```
+
+**Alternative: ECS rolling update with pre-deployment Job:**
+```yaml
+# Step 1: Run migration as ECS task (one-off, not service)
+aws ecs run-task --cluster prod \
+  --task-definition myapp-migration:5 \
+  --network-configuration '...' \
+  --overrides '{"containerOverrides":[{"name":"migrate","command":["python","manage.py","migrate"]}]}'
+
+# Wait for migration task to complete
+aws ecs wait tasks-stopped --cluster prod --tasks $MIGRATION_TASK_ARN
+
+# Step 2: Update service with new task definition (rolling)
+aws ecs update-service --cluster prod --service myapp \
+  --task-definition myapp:42 \
+  --deployment-configuration '{
+    "minimumHealthyPercent": 100,
+    "maximumPercent": 200
+  }'
+# minimumHealthyPercent=100: old tasks stay until new ones are healthy
+# maximumPercent=200: allows doubling capacity during transition
+```
+
+**Tricky**: The `minimumHealthyPercent: 100` + `maximumPercent: 200` pattern means ECS launches new tasks FIRST (doubling capacity), waits for them to be healthy, then drains old tasks. But this doubles your Fargate cost during deployment (running 2x tasks). For large services, use `minimumHealthyPercent: 50` to allow removing some old tasks before all new ones are ready — faster but riskier. Also, set `healthCheckGracePeriodSeconds` on the service (default 0) to give new tasks time to start before ALB health checks begin failing them.
+
+---

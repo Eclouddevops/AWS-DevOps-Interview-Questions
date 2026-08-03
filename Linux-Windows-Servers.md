@@ -666,3 +666,232 @@ journalctl -k | grep -i "oom"
 ```
 
 **Tricky**: A server with 1GB "free" and 14GB "buff/cache" is NOT out of memory! Linux aggressively uses RAM for disk caching. This is GOOD (faster disk access). It gives the cache back when apps need it. Only worry if "available" is low.
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q16: A production Linux server is responding slowly. Load average is 50 but CPU usage shows only 20%. Memory is 60% used. What's causing the high load average with low CPU?**
+
+**A:**
+
+**Understanding load average:**
+```
+Load average = number of processes in RUNNABLE + UNINTERRUPTIBLE SLEEP state
+- Runnable (R): waiting for CPU time
+- Uninterruptible sleep (D): waiting for I/O (disk, network)
+
+High load + Low CPU = processes waiting for I/O, NOT for CPU
+This is an I/O bottleneck, not a CPU bottleneck.
+```
+
+**Diagnosis:**
+```bash
+# Step 1: Check I/O wait
+top
+# Look at: %wa (I/O wait) — if high (>20%), confirms I/O bottleneck
+# us=20% sy=5% id=30% wa=45% ← 45% I/O wait!
+
+# Step 2: Find processes in D state (uninterruptible sleep)
+ps aux | awk '$8 ~ /D/ {print}'
+# Or:
+top -bn1 | grep " D "
+
+# Step 3: Check disk I/O
+iostat -x 1 5
+# Look at: %util (disk utilization), await (avg wait time), r/s, w/s
+# If %util > 80% → disk saturated
+# If await > 50ms → disk is slow (SSD should be <5ms)
+
+# Step 4: Find which process is causing I/O
+iotop -oP
+# Shows: actual disk read/write per process in real-time
+
+# Step 5: Check if it's EBS performance limit
+# For AWS EC2:
+# gp3: 3000 IOPS baseline, 125 MB/s throughput
+# If application needs more → throttled → high I/O wait
+aws cloudwatch get-metric-statistics --namespace AWS/EBS \
+  --metric-name VolumeQueueLength --period 60 --statistics Average \
+  --dimensions Name=VolumeId,Value=vol-xxx
+# QueueLength > 1 consistently = EBS throttled
+```
+
+**Common production causes:**
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| High wa%, single disk 100% util | One process writing excessive logs | Fix log rotation, move logs to separate volume |
+| High wa%, all disks busy | Database full table scan | Add missing index, optimize query |
+| High wa%, network storage (NFS/EFS) | Network latency to storage | Switch to local SSD, or increase EFS throughput mode |
+| Load 50+ with 0% wa | 50+ processes waiting for CPU (rare) | Under-provisioned CPU, too many threads |
+
+**Tricky**: On Linux, load average includes processes in "D" (uninterruptible sleep) state — this is unique to Linux. On other Unix systems, load average only counts runnable processes. So a Linux server with 0% CPU but load average of 100 is possible if 100 processes are stuck waiting for NFS/disk I/O. The fix is never "add more CPU" — it's fix the I/O bottleneck. Also, AWS EBS gp2 volumes have burst credits — when credits run out, IOPS drops from 3000 to baseline (3 IOPS per GB). A 100GB gp2 volume drops to 300 IOPS after burst = massive I/O wait.
+
+---
+
+**Q17: You SSH into a production server and discover disk is 100% full. The application is down. You need to free space immediately but you don't know what's consuming it. Walk through your emergency procedure.**
+
+**A:**
+
+**Emergency response (first 60 seconds):**
+```bash
+# Step 1: Confirm disk usage
+df -h
+# /dev/xvda1    100G   100G     0 100% /
+
+# Step 2: Find largest directories (top-level)
+du -sh /* 2>/dev/null | sort -rh | head -10
+# /var       85G
+# /home      10G
+# /tmp        5G
+
+# Step 3: Drill into the largest
+du -sh /var/* | sort -rh | head -5
+# /var/log    80G  ← LOGS!
+
+# Step 4: Find the specific large files
+find /var/log -type f -size +1G -exec ls -lh {} \;
+# -rw-r--r-- 1 root root 75G Jan 20 15:30 /var/log/application/app.log
+
+# Step 5: IMMEDIATE space recovery (truncate, don't delete!)
+> /var/log/application/app.log
+# or: truncate -s 0 /var/log/application/app.log
+# This clears the file but keeps the file handle valid (app can keep writing)
+```
+
+**Why truncate instead of delete:**
+```bash
+# WRONG: rm /var/log/application/app.log
+# The application still has the file OPEN (file descriptor)
+# Linux doesn't release disk space until ALL file descriptors are closed
+# lsof | grep deleted → shows "deleted" files still consuming space
+# Space is NOT freed until application restarts!
+
+# RIGHT: truncate (or > file)
+# Clears content but keeps inode/fd intact
+# Application continues writing to same file (now empty)
+# Disk space freed IMMEDIATELY
+
+# If you already deleted: find and close the file descriptors
+lsof +L1  # Find deleted files still open
+# Then restart the application to release them
+```
+
+**Prevent recurrence:**
+```bash
+# Set up log rotation
+cat > /etc/logrotate.d/application << 'EOF'
+/var/log/application/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    maxsize 1G
+    copytruncate       # Truncate in place (no restart needed)
+    postrotate
+        /usr/bin/systemctl reload application 2>/dev/null || true
+    endscript
+}
+EOF
+
+# Set up disk space monitoring
+# CloudWatch Agent or custom alert:
+# Alert at 80% → investigate
+# Alert at 90% → emergency
+# Auto-remediate at 85% → delete old logs automatically
+```
+
+**Tricky**: The `lsof +L1` trick is essential. If someone `rm`'d a 50GB log file but the application still has it open, `df` still shows disk full but `du` shows plenty of space. This confusing mismatch (df != du) is because `du` counts files on disk (deleted file is gone from directory), but `df` counts blocks in use (file descriptor still holds the blocks). Only `lsof +L1` reveals the "invisible" deleted files consuming space.
+
+---
+
+**Q18: A production server suddenly can't resolve DNS. `ping 8.8.8.8` works (network is fine) but `ping google.com` fails with "Name or service not known." All other servers in the same subnet work fine. What's wrong with this specific server?**
+
+**A:**
+
+**Systematic DNS debugging:**
+```bash
+# Step 1: Check /etc/resolv.conf
+cat /etc/resolv.conf
+# Expected (AWS): nameserver 10.0.0.2 (VPC DNS resolver at VPC CIDR +2)
+# If empty or wrong → DNS broken
+# Common: someone edited it manually, or DHCP client overwrote it
+
+# Step 2: Test DNS directly
+nslookup google.com 10.0.0.2    # Query VPC DNS directly
+dig @10.0.0.2 google.com        # Same with dig
+# If this works → /etc/resolv.conf is wrong or nsswitch.conf issue
+# If this fails → network issue to DNS resolver
+
+# Step 3: Check nsswitch.conf
+cat /etc/nsswitch.conf | grep hosts
+# Expected: hosts: files dns
+# If it says: hosts: files → DNS not used! Only /etc/hosts checked
+# If it says: hosts: files mdns4_minimal [NOTFOUND=return] dns
+#   → mDNS intercepts and returns "not found" before DNS is tried
+
+# Step 4: Check if systemd-resolved is interfering
+systemctl status systemd-resolved
+resolvectl status
+# If resolved is running but misconfigured → DNS breaks
+# Check: ls -la /etc/resolv.conf
+# If symlink to /run/systemd/resolve/stub-resolv.conf → using resolved
+
+# Step 5: Check if DNS port is reachable
+nc -zvu 10.0.0.2 53
+# If blocked → security group or NACL blocking UDP 53
+```
+
+**Common production causes:**
+```
+1. /etc/resolv.conf overwritten by DHCP renewal:
+   - DHCP client ran and overwrote custom DNS settings
+   - Fix: Make immutable: chattr +i /etc/resolv.conf
+   - Better: Configure DNS in dhclient.conf or netplan
+
+2. systemd-resolved conflict:
+   - Ubuntu 18.04+ uses systemd-resolved (127.0.0.53)
+   - If resolved crashes → all DNS fails
+   - Fix: systemctl restart systemd-resolved
+
+3. DNS throttling (AWS VPC limit):
+   - 1024 DNS queries per second per ENI
+   - High-traffic server exceeded limit → queries dropped
+   - Fix: Install local DNS cache (dnsmasq, unbound)
+
+4. /etc/hosts too large:
+   - Some tools add entries to /etc/hosts (Docker, Kubernetes)
+   - 100,000+ entries → DNS lookup slow or fails
+   - hosts: files checked FIRST → takes too long → timeout
+
+5. MTU issue for DNS over TCP:
+   - Large DNS responses use TCP (>512 bytes)
+   - MTU mismatch → TCP DNS packets fragmented and lost
+   - UDP works (small responses) but TCP fails (large responses like TXT records)
+```
+
+**Quick fix:**
+```bash
+# Restore DNS immediately
+echo "nameserver 10.0.0.2" > /etc/resolv.conf
+# Test
+dig google.com +short
+# Should return IP addresses
+
+# Install local DNS cache (prevents future issues)
+apt-get install dnsmasq
+echo "server=10.0.0.2" > /etc/dnsmasq.d/aws.conf
+systemctl restart dnsmasq
+# Update resolv.conf to use local cache
+echo "nameserver 127.0.0.1" > /etc/resolv.conf
+```
+
+**Tricky**: On AWS, the VPC DNS resolver (AmazonProvidedDNS at VPC_CIDR+2) has a hard limit of 1024 packets per second per ENI. High-traffic instances (especially in EKS with many pods doing DNS lookups) can exceed this. The queries are silently dropped — no error, just 5-second timeout before retry. This shows up as random "slow DNS" rather than complete failure. The fix: NodeLocal DNSCache (Kubernetes) or dnsmasq/unbound on the instance. CloudWatch metric: none exists for this — you can only detect it by measuring DNS query latency.
+
+---

@@ -695,3 +695,199 @@ spec:
 kubectl exec test-pod -- nslookup google.com 8.8.8.8
 # If this works, problem is CoreDNS upstream forwarding
 ```
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q21: Your pods can reach external services (internet) but cannot communicate with pods in another namespace. NetworkPolicies exist in both namespaces. How do you debug cross-namespace communication?**
+
+**A:**
+
+**Debugging steps:**
+```bash
+# Step 1: Check NetworkPolicies in BOTH namespaces
+kubectl get networkpolicy -n namespace-a
+kubectl get networkpolicy -n namespace-b
+
+# Step 2: The crucial detail — NetworkPolicies are ADDITIVE for allow but DEFAULT DENY
+# If namespace-b has ANY NetworkPolicy with podSelector matching the target pod,
+# then ALL ingress not explicitly allowed is DENIED
+
+# Check if namespace-b allows ingress from namespace-a:
+kubectl get networkpolicy -n namespace-b -o yaml | grep -A 20 "ingress"
+
+# Step 3: Test connectivity
+kubectl exec -n namespace-a test-pod -- curl -v http://service-b.namespace-b.svc.cluster.local:8080
+```
+
+**Common cross-namespace NetworkPolicy mistakes:**
+```yaml
+# WRONG: This only allows traffic from SAME namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-app-traffic
+  namespace: namespace-b
+spec:
+  podSelector:
+    matchLabels:
+      app: service-b
+  ingress:
+  - from:
+    - podSelector:          # No namespaceSelector = same namespace only!
+        matchLabels:
+          app: service-a
+
+# CORRECT: Allow cross-namespace traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cross-namespace
+  namespace: namespace-b
+spec:
+  podSelector:
+    matchLabels:
+      app: service-b
+  ingress:
+  - from:
+    - namespaceSelector:      # Must specify namespace!
+        matchLabels:
+          kubernetes.io/metadata.name: namespace-a
+      podSelector:
+        matchLabels:
+          app: service-a
+```
+
+**Tricky**: In NetworkPolicy, `podSelector` without `namespaceSelector` means "pods in THIS namespace only." To allow cross-namespace, you MUST include `namespaceSelector`. Also, the `-` (dash) before `namespaceSelector` matters for AND vs OR logic. With dash: each item is OR'd. Without dash (same list item): AND'd together. This subtle YAML difference is the #1 cause of broken NetworkPolicies.
+
+---
+
+**Q22: After enabling Calico as your CNI, some pods can reach the internet but others cannot. All pods are in the same subnet. The ones that fail are always on specific nodes. What's happening?**
+
+**A:**
+
+**The node-specific networking issue:**
+```bash
+# Check which nodes have failing pods
+kubectl get pods -o wide | grep -v Running
+
+# Check iptables on failing nodes
+ssh node-3 "iptables -t nat -L POSTROUTING -n | grep -i masq"
+# If MASQUERADE rule is missing → pods can't reach internet (no SNAT)
+
+# Check Calico node status
+kubectl get pods -n kube-system -l k8s-app=calico-node -o wide
+# Is calico-node pod Running on the failing nodes?
+
+# Check BGP peering (if using Calico BGP mode)
+kubectl exec -n kube-system calico-node-xxx -- birdcl show protocols
+```
+
+**Common causes:**
+```
+1. calico-node DaemonSet not running on specific nodes
+   - Node taint preventing scheduling
+   - Node label mismatch with DaemonSet nodeSelector
+   - Fix: Check DaemonSet tolerations and node selectors
+
+2. IP-in-IP tunnel broken on specific nodes
+   - MTU mismatch (node network MTU < tunnel overhead)
+   - Firewall blocking protocol 4 (IPIP) between nodes
+   - Fix: Use VXLAN mode instead (UDP, passes through firewalls)
+
+3. iptables rules not applied
+   - kube-proxy mode mismatch (iptables vs IPVS)
+   - calico-node crashed and left stale rules
+   - Fix: Restart calico-node on affected nodes
+
+4. BGP route not propagated
+   - New node joined but BGP session not established
+   - Route reflector unreachable from specific nodes
+   - Fix: Check BGP peer status with calicoctl
+```
+
+**Fix for IPIP/VXLAN issues:**
+```yaml
+# Switch from IPIP to VXLAN (works through most firewalls)
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: default-pool
+spec:
+  cidr: 192.168.0.0/16
+  ipipMode: Never          # Disable IPIP
+  vxlanMode: Always        # Use VXLAN instead
+  natOutgoing: true        # Enable SNAT for internet access
+```
+
+**Tricky**: Calico's IPIP mode uses IP protocol 4 (not TCP/UDP). Many corporate firewalls, cloud security groups, and network ACLs only allow TCP/UDP/ICMP. IPIP packets get silently dropped → pods on nodes behind restrictive firewalls can't communicate with pods on other nodes. VXLAN uses UDP port 4789 — much more firewall-friendly. If you see partial connectivity (some nodes work, others don't), suspect protocol filtering.
+
+---
+
+**Q23: Your Kubernetes service is load-balancing unevenly — one pod gets 80% of traffic while other 4 pods get 5% each. The Service type is ClusterIP with no session affinity. Why?**
+
+**A:**
+
+**Causes of uneven load distribution:**
+```
+1. KEEPALIVE CONNECTIONS (most common):
+   - Client maintains persistent HTTP/2 or gRPC connections
+   - kube-proxy load-balances at CONNECTION creation, not per-request
+   - Client creates 1 connection → all requests go to same pod
+   - 5 clients, but 4 connect to pod-1 by chance = 80% traffic
+
+2. NODE-LOCAL SERVICE ROUTING:
+   - externalTrafficPolicy: Local
+   - Traffic enters through one node → only sent to pods on THAT node
+   - If 4 pods on node-1, 1 pod on node-2, and LB sends 80% to node-1...
+
+3. IPTABLES PROBABILITY:
+   - kube-proxy iptables uses random probability
+   - With 5 pods: each rule has 1/5, 1/4, 1/3, 1/2, 1/1 probability
+   - Statistically fair but for low request counts, can appear uneven
+
+4. SLOW POD:
+   - One pod responds fast (10ms) → handles more concurrent requests
+   - Other pods slow (500ms) → fewer requests complete
+   - Monitoring shows "more requests" to fast pod (actually better!)
+```
+
+**Fix for keepalive imbalance:**
+```yaml
+# Option 1: Use headless service with client-side load balancing (gRPC)
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-grpc-service
+spec:
+  clusterIP: None  # Headless — returns all pod IPs
+  selector:
+    app: my-grpc-service
+
+# gRPC client then load-balances across all returned IPs per-request
+
+# Option 2: Use service mesh (Istio/Linkerd) for L7 load balancing
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: my-service-lb
+spec:
+  host: my-service
+  trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN  # Per-request, not per-connection
+    connectionPool:
+      http:
+        maxRequestsPerConnection: 100  # Force connection recycling
+
+# Option 3: For non-mesh, add a sidecar proxy (envoy) that does L7 LB
+```
+
+**Tricky**: kube-proxy (iptables mode) does Layer 4 load balancing — it picks a backend when the TCP connection is established. For HTTP/1.1 with keepalive or HTTP/2 (multiplexed), all requests on one connection go to the SAME pod. This is by design, not a bug. To get per-request balancing, you need an L7 proxy (Ingress controller, service mesh, or sidecar). IPVS mode with `--ipvs-scheduler=lc` (least connections) is slightly better but still connection-based.
+
+---
