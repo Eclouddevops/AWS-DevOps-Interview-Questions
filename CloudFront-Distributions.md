@@ -417,3 +417,195 @@ Requires: Origin sends without Content-Encoding, viewer sends Accept-Encoding
 ```
 
 **Tricky**: CloudFront won't compress if origin already compressed the response (has Content-Encoding header). Remove compression at origin and let CloudFront handle it for optimal edge caching.
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q12: After deploying a new version of your React SPA, some users see the old version and some see the new version. Clearing browser cache doesn't help for affected users. What's happening?**
+
+**A:**
+
+**The cache layering problem:**
+```
+User → CloudFront Edge (cached old index.html) → Origin (has new index.html)
+
+Timeline:
+1. Old version deployed: index.html + main.abc123.js (hashed)
+2. New version deployed: index.html + main.def456.js (hashed)
+3. User A: CloudFront edge has cached old index.html (TTL not expired)
+   → Gets old index.html → loads old main.abc123.js → sees OLD version
+4. User B: Different edge location, cache expired
+   → Gets new index.html → loads new main.def456.js → sees NEW version
+```
+
+**Why "clear browser cache" doesn't help:**
+```
+The problem is CloudFront cache, not browser cache.
+Even if user clears browser cache:
+- Request goes to CloudFront edge → edge returns cached OLD index.html
+- Browser gets old index.html → references old JS bundle
+- Old JS bundle also cached at edge → serves old version
+```
+
+**Fix:**
+```bash
+# Immediate: Invalidate CloudFront cache
+aws cloudfront create-invalidation --distribution-id E123456 \
+  --paths "/index.html" "/asset-manifest.json" "/service-worker.js"
+# NOTE: Only invalidate non-hashed files. Hashed files (main.abc123.js) are safe
+# because new index.html will reference main.def456.js (new hash)
+
+# Better: Set proper cache headers per file type
+# Origin (S3/ALB) should set:
+# index.html: Cache-Control: no-cache, no-store, must-revalidate
+# *.js, *.css (hashed): Cache-Control: public, max-age=31536000, immutable
+# images (hashed): Cache-Control: public, max-age=31536000, immutable
+
+# CloudFront behavior configuration:
+# Path: /index.html → TTL: 0 (always revalidate with origin)
+# Path: /static/* → TTL: 31536000 (1 year, content-hashed)
+# Path: *.html → TTL: 0
+
+# In CloudFront distribution:
+aws cloudfront update-distribution --id E123456 \
+  --default-cache-behavior '{
+    "DefaultTTL": 0,
+    "MaxTTL": 0,
+    "MinTTL": 0,
+    "ForwardedValues": {"QueryString": false, "Cookies": {"Forward": "none"}}
+  }'
+```
+
+**Proper SPA deployment strategy:**
+```bash
+#!/bin/bash
+# deploy-spa.sh
+
+# 1. Upload hashed assets FIRST (they're new URLs, no conflict)
+aws s3 sync build/static/ s3://my-bucket/static/ \
+  --cache-control "public,max-age=31536000,immutable"
+
+# 2. Upload index.html LAST (switches to new version)
+aws s3 cp build/index.html s3://my-bucket/index.html \
+  --cache-control "no-cache,no-store,must-revalidate"
+
+# 3. Invalidate index.html at CloudFront edge
+aws cloudfront create-invalidation --distribution-id $CF_DIST \
+  --paths "/index.html"
+
+# 4. Wait for invalidation (takes 30s-5min)
+aws cloudfront wait invalidation-completed --distribution-id $CF_DIST \
+  --id $INVALIDATION_ID
+```
+
+**Tricky**: CloudFront invalidation costs money after 1,000 paths/month ($0.005 per path). Invalidating `/*` counts as ONE path but invalidates everything (cache efficiency destroyed for all assets). The optimal approach: NEVER invalidate hashed assets, ONLY invalidate `index.html` and other non-hashed entry points. This preserves cache for 99% of requests (static assets) while ensuring fresh content for the HTML shell.
+
+---
+
+**Q13: Your CloudFront distribution serves API responses (dynamic content) with `Cache-Control: no-store`. But you're still paying significant data transfer costs through CloudFront. A colleague asks: "If nothing is cached, why use CloudFront at all?" What's your answer?**
+
+**A:**
+
+**Benefits of CloudFront even without caching:**
+```
+1. LOWER DATA TRANSFER COST:
+   - EC2/ALB → Internet: $0.09/GB
+   - CloudFront → Internet: $0.085/GB (US/EU)
+   - Savings: 5-15% on data transfer alone
+   - At 100TB/month: saves $500-$1,500/month
+
+2. GLOBAL ACCELERATION:
+   - User connects to nearest CloudFront edge (200+ locations)
+   - Edge → Origin uses AWS backbone network (faster than public internet)
+   - Reduces latency by 20-60% for distant users
+   - TCP connection reuse between edge and origin
+
+3. DDoS PROTECTION (included free):
+   - CloudFront = AWS Shield Standard (automatic L3/L4 protection)
+   - Absorbs volumetric attacks at the edge (before reaching origin)
+   - No extra cost for Shield Standard on CloudFront
+
+4. SSL TERMINATION AT EDGE:
+   - TLS handshake at nearest edge (low latency)
+   - HTTP/2 and HTTP/3 at edge (even if origin only speaks HTTP/1.1)
+   
+5. WAF INTEGRATION:
+   - CloudFront + WAF blocks malicious traffic before it reaches origin
+   - Origin only sees legitimate traffic = less compute needed
+
+6. CONNECTION COALESCING:
+   - 10,000 users connect to edge → edge maintains 10 connections to origin
+   - Origin handles 10 connections instead of 10,000
+   - Massive reduction in origin load
+```
+
+**When to NOT use CloudFront for APIs:**
+```
+- WebSocket connections (CloudFront has 30-second idle timeout)
+- Server-Sent Events (SSE) — CloudFront buffers responses
+- APIs that need real-time with <50ms latency to origin (edge adds 1-5ms)
+- Internal APIs (within same VPC) — use ALB directly
+```
+
+**Tricky**: Even with `Cache-Control: no-store`, CloudFront can still serve a "conditional" cache using `If-Modified-Since` or `If-None-Match` headers. If origin returns 304 Not Modified, CloudFront serves from cache → reduces origin load and bandwidth. This is different from "no caching" — it's "revalidation caching." For truly no-cache behavior, both the origin must respond with no-store AND CloudFront cache policy must have TTL=0.
+
+---
+
+**Q14: CloudFront is returning stale content even after you invalidated the cache. The invalidation shows "Completed" in the console. Users in some regions get old content while others get new content. Why?**
+
+**A:**
+
+**Why invalidation "completed" but content is stale:**
+```
+1. MULTIPLE CACHE LAYERS:
+   CloudFront has TWO cache tiers:
+   - Regional Edge Caches (13 locations) ← Invalidation hits these
+   - Edge Locations (200+ locations) ← May still have old content
+   
+   Invalidation propagates: API → Regional → Edge locations
+   It can take up to 10-15 minutes for ALL 200+ edges to clear
+   "Completed" means AWS accepted the request, not that all edges cleared
+
+2. BROWSER/ISP CACHE:
+   - CloudFront sent "max-age=86400" with old response
+   - User's browser cached for 24 hours
+   - CloudFront invalidation doesn't affect browser cache!
+   - Users must hard-refresh (Ctrl+Shift+R) or wait for TTL expiry
+
+3. QUERY STRING VARIATION:
+   - You invalidated: /api/products
+   - But users request: /api/products?v=123
+   - If CloudFront forwards query strings → different cache key!
+   - Must invalidate: /api/products* (with wildcard)
+
+4. CUSTOM CACHE KEY (cookies, headers):
+   - Cache policy includes "Accept-Language" header
+   - Invalidation clears /index.html for ALL variations
+   - But if policy uses cookies → may need cookie-specific invalidation
+```
+
+**Proper invalidation:**
+```bash
+# Invalidate with wildcard (catches all query string variations)
+aws cloudfront create-invalidation --distribution-id E123456 \
+  --paths "/api/products*" "/static/*"
+
+# For truly instant global update — use versioned URLs
+# Old: /api/v1/products → Cache-Control: max-age=300
+# New: /api/v2/products → Completely new cache key
+# No invalidation needed! New URL = cache miss everywhere
+
+# Or use Cache-Control: s-maxage=0 + stale-while-revalidate
+# Response: Cache-Control: s-maxage=0, stale-while-revalidate=300
+# CloudFront serves stale immediately but revalidates in background
+# Next request gets fresh content
+```
+
+**Tricky**: CloudFront `Invalidation Completed` is misleading. It means the invalidation request was processed by the CloudFront control plane, NOT that all 200+ edge locations have purged their cache. Full global propagation can take up to 15 minutes after "Completed" status. For business-critical updates, use versioned URLs (cache-busting) instead of invalidation. Also, invalidating `/*` takes longer than specific paths because it must traverse all objects in the distribution.
+
+---

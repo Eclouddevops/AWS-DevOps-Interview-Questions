@@ -1232,3 +1232,219 @@ sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
 ```
 
 **Tricky**: `cpu_usage_steal` is critical for T-instances. High steal % means the hypervisor is taking CPU away from your instance (burst credits exhausted, noisy neighbor on bare metal). This is INVISIBLE without the agent!
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q26: Your CloudWatch alarm for high CPU triggers at 2 AM every night (alarm state for 5 minutes, then resolves). Investigation shows no actual performance issues during that time. Users don't notice anything. How do you fix this false alarm without missing real issues?**
+
+**A:**
+
+**Why the alarm triggers but nothing is wrong:**
+```
+1. SCHEDULED BATCH JOB:
+   - Cron job at 2 AM: backup, log rotation, metrics aggregation
+   - Spikes CPU to 90% for 3 minutes
+   - Alarm threshold: CPU > 80% for 3/5 datapoints (1-min periods)
+   - 3 consecutive points above 80% → ALARM!
+   - Job finishes → CPU drops → OK state
+   - This is EXPECTED behavior, not a problem
+
+2. METRIC MATH AVERAGING CONFUSION:
+   - CPU metric reported every 5 minutes (basic monitoring)
+   - Alarm evaluates 1-minute periods (but data is 5-min resolution)
+   - CloudWatch backfills: one 5-min datapoint treated as 5 identical 1-min points
+   - A single 85% reading becomes 5 datapoints of 85% → exceeds threshold
+
+3. STEAL TIME on shared instances (t-series burstable):
+   - Other tenants using physical CPU → your instance gets "steal" time
+   - Shows as CPU utilization even though YOUR app isn't busy
+   - Fix: Switch to dedicated/non-burstable instance types
+```
+
+**Fix strategies:**
+```bash
+# Strategy 1: Exclude known batch windows using Metric Math
+# Create alarm that ignores 2-3 AM window:
+aws cloudwatch put-metric-alarm --alarm-name "CPU-High-Production" \
+  --metrics '[
+    {"Id":"cpu","MetricStat":{"Metric":{"Namespace":"AWS/EC2","MetricName":"CPUUtilization","Dimensions":[{"Name":"InstanceId","Value":"i-xxx"}]},"Period":300,"Stat":"Average"}},
+    {"Id":"hour","Expression":"HOUR(cpu)"},
+    {"Id":"filtered","Expression":"IF(hour >= 2 AND hour < 3, 0, cpu)"}
+  ]' \
+  --threshold 80 --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 3 --datapoints-to-alarm 3 \
+  --treat-missing-data notBreaching
+
+# Strategy 2: Use composite alarms (require multiple signals)
+aws cloudwatch put-composite-alarm --alarm-name "Real-CPU-Issue" \
+  --alarm-rule 'ALARM("CPU-High") AND ALARM("Response-Latency-High")'
+# Only fires if BOTH CPU is high AND latency is affected
+# Batch job = high CPU but normal latency → doesn't fire
+
+# Strategy 3: Increase evaluation period
+# Instead of 3/5 datapoints at 1-min:
+# Use 3/5 datapoints at 5-min periods = must be sustained 15+ minutes
+--period 300 --evaluation-periods 5 --datapoints-to-alarm 3
+# 5-min batch job won't sustain alarm across 3 five-minute periods
+```
+
+**Tricky**: CloudWatch alarms with `treat-missing-data: missing` (default) will stay in ALARM state if data stops flowing (instance dies). Use `treat-missing-data: notBreaching` for most alarms so that missing data = assume OK. But for availability alarms (instance health), use `treat-missing-data: breaching` so missing data = assume problem. The wrong choice here either causes false alarms (instance reboot = alarm) or missed outages (instance dead = no alarm).
+
+---
+
+**Q27: Your custom CloudWatch metrics are delayed by 5-10 minutes. By the time an alarm fires, the issue has been ongoing for 10+ minutes. How do you get near-real-time alerting?**
+
+**A:**
+
+**Understanding metric delays:**
+```
+Where delays happen:
+1. Application emits metric → CloudWatch Agent buffer (10-60s)
+2. Agent sends to CloudWatch API → API processing (0-2s)
+3. Metric visible in CloudWatch (0-60s)
+4. Alarm evaluation (evaluates every "Period" seconds)
+5. Alarm state change → SNS notification (1-5s)
+
+Total: 1-5 minutes minimum with standard settings
+```
+
+**Reducing to near-real-time (<60s):**
+```bash
+# Fix 1: CloudWatch Agent flush interval
+# /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json:
+{
+  "metrics": {
+    "metrics_collected": {
+      "statsd": {
+        "metrics_aggregation_interval": 10  # Aggregate every 10s (not 60s)
+      }
+    },
+    "force_flush_interval": 5  # Flush to CloudWatch every 5 seconds!
+  }
+}
+
+# Fix 2: Use high-resolution metrics (1-second resolution)
+aws cloudwatch put-metric-data --namespace "MyApp" \
+  --metric-data '[{
+    "MetricName": "RequestLatency",
+    "Value": 250,
+    "Unit": "Milliseconds",
+    "StorageResolution": 1
+  }]'
+# StorageResolution=1 → data stored at 1-second granularity
+# Default is 60 seconds
+
+# Fix 3: Set alarm period to minimum
+aws cloudwatch put-metric-alarm --alarm-name "LatencyHigh" \
+  --period 10 \                       # Evaluate every 10 seconds!
+  --evaluation-periods 3 \            # 3 consecutive breaches
+  --datapoints-to-alarm 3 \           # All 3 must breach
+  --treat-missing-data notBreaching
+# Total detection time: 30 seconds (3 × 10s)
+
+# Fix 4: Use Embedded Metric Format (EMF) for instant metrics
+# Application logs in EMF → CloudWatch Logs → automatic metric extraction
+# No agent buffering delay!
+console.log(JSON.stringify({
+  "_aws": {
+    "Timestamp": Date.now(),
+    "CloudWatchMetrics": [{
+      "Namespace": "MyApp",
+      "Dimensions": [["Service", "Endpoint"]],
+      "Metrics": [{"Name": "Latency", "Unit": "Milliseconds"}]
+    }]
+  },
+  "Service": "payment-api",
+  "Endpoint": "/charge",
+  "Latency": 250
+}));
+```
+
+**Alternative: Skip CloudWatch for ultra-fast alerting:**
+```bash
+# For sub-10-second alerting, use streaming:
+# App → CloudWatch Logs → Subscription Filter → Lambda → SNS/PagerDuty
+
+# Or: App → Kinesis Data Stream → Lambda (processes in real-time)
+# Detection in <5 seconds
+
+# Prometheus + Alertmanager (Kubernetes):
+# scrape_interval: 10s + evaluation_interval: 10s = 20s to detect
+# Much faster than CloudWatch for K8s workloads
+```
+
+**Tricky**: High-resolution metrics (1-second) cost MORE: $0.30 per metric per month vs $0.30 per metric per month for standard. But the real cost driver is NUMBER of metrics, not resolution. Also, high-resolution metrics are only stored at 1-second granularity for 3 hours, then aggregated to 1-minute for 15 days, then 5-minute for 63 days. You can't query 1-second data from last week — it's already aggregated.
+
+---
+
+**Q28: Your CloudWatch dashboard shows CPU at 45% average but your application team reports "the server is at 100% CPU." Both are correct. How is this possible and who should you believe?**
+
+**A:**
+
+**How both can be true:**
+```
+Scenario 1: MULTI-CORE AVERAGING
+- Instance has 8 CPUs
+- 4 CPUs at 100%, 4 CPUs at 0%
+- CloudWatch reports AVERAGE: (4×100 + 4×0) / 8 = 50%
+- Application (single-threaded) sees 100% on its core
+- Top shows: %Cpu0: 100%, %Cpu1: 100%, %Cpu2: 100%, %Cpu3: 100%
+            %Cpu4: 0%, %Cpu5: 0%, %Cpu6: 0%, %Cpu7: 0%
+- Fix: Use per-core metrics or look at application-specific CPU
+
+Scenario 2: TIME AVERAGING
+- CPU spikes to 100% for 30 seconds, then 0% for 30 seconds
+- CloudWatch 1-minute average: (100+0)/2 = 50%
+- User experiences: 50% of requests hit during 100% spike → timeout
+- Fix: Use Maximum statistic instead of Average
+
+Scenario 3: CONTAINER vs HOST METRICS
+- CloudWatch reports HOST CPU: 45% (of m5.2xlarge = 8 vCPU)
+- Container has 1 vCPU limit → container is at 100% of its limit
+- Host has plenty of capacity, but container is throttled
+- Fix: Monitor container metrics (CAdvisor, CloudWatch Container Insights)
+
+Scenario 4: STEAL TIME hidden in CloudWatch
+- CloudWatch CPU includes ALL usage (user+system+nice+steal)
+- Server at 45% CloudWatch = 35% app + 10% steal
+- From app perspective: it's getting throttled 10% of the time
+- Top shows: %st: 10% (burstable instance credits depleted)
+```
+
+**What to actually monitor:**
+```bash
+# CloudWatch: good for host-level, bad for application-level
+# For accurate application CPU:
+
+# Option 1: CloudWatch Agent custom metrics (per-process)
+{
+  "metrics": {
+    "metrics_collected": {
+      "procstat": [{
+        "pattern": "java.*myapp",
+        "measurement": ["cpu_usage", "memory_rss", "num_threads"]
+      }]
+    }
+  }
+}
+
+# Option 2: Application-level metrics (most accurate)
+# Expose /metrics endpoint with:
+# - process_cpu_seconds_total (Prometheus format)
+# - Per-endpoint request processing time
+# - Thread pool utilization
+
+# Option 3: Container Insights (for ECS/EKS)
+# Shows per-container CPU, memory, network
+# This is what the application actually experiences
+```
+
+**Tricky**: CloudWatch EC2 CPUUtilization metric reports the AVERAGE across all vCPUs at 5-minute (basic) or 1-minute (detailed) intervals. A single-threaded application on an 8-core instance can be completely CPU-bound (100% on one core) while CloudWatch shows 12.5%. For accurate monitoring: use per-CPU metrics from CloudWatch Agent, use the `Maximum` statistic (catches spikes), and always correlate with application-level latency metrics.
+
+---

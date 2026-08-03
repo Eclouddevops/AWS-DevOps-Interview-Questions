@@ -545,3 +545,243 @@ Config Rule violation detected
 - Aggregates compliance status across all accounts
 - Security score per account
 - Dashboard for leadership reporting
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q16: Your AWS GuardDuty detected "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration" — an EC2 instance's IAM role credentials are being used from OUTSIDE AWS. How do you respond?**
+
+**A:**
+
+**What happened:**
+```
+An attacker gained access to the EC2 instance metadata service (IMDS)
+and stole the temporary IAM role credentials. They're now using these
+credentials from their own machine (external IP) to access your AWS resources.
+
+Attack vector (usually SSRF):
+1. Application has Server-Side Request Forgery vulnerability
+2. Attacker sends: GET http://169.254.169.254/latest/meta-data/iam/security-credentials/role-name
+3. Gets AccessKeyId, SecretAccessKey, and SessionToken
+4. Uses credentials from their own machine → GuardDuty detects external usage
+```
+
+**Immediate response (first 5 minutes):**
+```bash
+# Step 1: Identify the compromised instance
+# GuardDuty finding contains the instance ID and role ARN
+
+# Step 2: Revoke ALL active sessions for the role (nuclear option)
+aws iam put-role-policy --role-name compromised-role \
+  --policy-name DenyAllAfterCompromise \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "DateLessThan": {"aws:TokenIssueTime": "2024-01-20T15:00:00Z"}
+      }
+    }]
+  }'
+# This denies ALL actions for tokens issued BEFORE now
+# New credentials from the instance will still work (issued after this time)
+# Stolen credentials become useless immediately
+
+# Step 3: Check what the attacker did
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=ASIA... \
+  --start-time $(date -d '24 hours ago' --iso-8601) \
+  --query 'Events[?sourceIPAddress!=`ec2.amazonaws.com`].[EventTime,EventName,SourceIPAddress]'
+
+# Step 4: Isolate the instance
+aws ec2 modify-instance-attribute --instance-id i-compromised \
+  --groups sg-isolate-only  # Security group that allows NO inbound/outbound
+```
+
+**Prevention:**
+```bash
+# 1. Enforce IMDSv2 (blocks SSRF attacks on metadata)
+aws ec2 modify-instance-metadata-options --instance-id i-xxx \
+  --http-tokens required \     # Forces IMDSv2 (token-based)
+  --http-put-response-hop-limit 1  # Token can't be forwarded through proxies
+
+# 2. Organization-wide SCP to enforce IMDSv2 on all new instances
+{
+  "Statement": [{
+    "Effect": "Deny",
+    "Action": "ec2:RunInstances",
+    "Resource": "arn:aws:ec2:*:*:instance/*",
+    "Condition": {
+      "StringNotEquals": {"ec2:MetadataHttpTokens": "required"}
+    }
+  }]
+}
+
+# 3. Scope down IAM roles (least privilege)
+# Don't give EC2 roles admin access
+# Use condition keys to restrict credential usage to VPC only:
+"Condition": {
+  "StringEquals": {"aws:SourceVpc": "vpc-12345"}
+}
+```
+
+**Tricky**: IMDSv2 with `http-put-response-hop-limit=1` prevents credential theft via SSRF in containers and proxied applications. The token request uses PUT (not GET) and the response TTL of 1 hop means the token can't be forwarded through the application layer. But many legacy applications and SDKs don't support IMDSv2 — test thoroughly before enforcing. AWS SDK v2+ supports it, but older libraries may break.
+
+---
+
+**Q17: Your AWS Config rule flags that 200 security groups have SSH (port 22) open to 0.0.0.0/0. Security wants it fixed in 24 hours. But development teams say they need SSH access. How do you close the gap without blocking developers?**
+
+**A:**
+
+**Auto-remediation with AWS Config + SSM:**
+```bash
+# Step 1: Create AWS Config remediation rule
+# Automatically removes 0.0.0.0/0 SSH rules when detected
+aws configservice put-remediation-configurations --remediation-configurations '{
+  "ConfigRuleName": "restricted-ssh",
+  "TargetType": "SSM_DOCUMENT",
+  "TargetId": "AWS-DisablePublicAccessForSecurityGroup",
+  "Parameters": {
+    "GroupId": {"ResourceValue": {"Value": "RESOURCE_ID"}}
+  },
+  "Automatic": true,
+  "MaximumAutomaticAttempts": 3,
+  "RetryAttemptSeconds": 60
+}'
+```
+
+**Replace SSH with Session Manager (the real answer):**
+```bash
+# Session Manager: shell access WITHOUT port 22 open, NO bastion needed
+aws ssm start-session --target i-0abc123def
+# Benefits:
+# - No SSH key management
+# - No bastion hosts
+# - No port 22 open anywhere
+# - Full audit trail in CloudTrail
+# - IAM-based access control (who can access which instances)
+# - Works through NAT (no public IP needed on instance)
+
+# IAM policy for developer SSH access via Session Manager:
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["ssm:StartSession"],
+    "Resource": [
+      "arn:aws:ec2:*:*:instance/*"
+    ],
+    "Condition": {
+      "StringLike": {"ssm:resourceTag/Environment": "development"}
+    }
+  }]
+}
+# Developers can ONLY access instances tagged Environment=development
+```
+
+**For teams that truly need SSH (port forwarding, SCP):**
+```bash
+# SSH over Session Manager (port 22 NOT needed in security group!)
+# ~/.ssh/config:
+Host i-*
+  ProxyCommand sh -c "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+
+# Now: ssh ec2-user@i-0abc123def
+# Tunnels through Session Manager → no port 22 required
+```
+
+**Tricky**: Simply removing 0.0.0.0/0 from security groups will break any developer who's actively SSHed in — their session continues but they can't reconnect. Give 24-hour notice, set up Session Manager, verify access works, THEN remove SSH rules. Also, AWS Config auto-remediation can trigger on EVERY security group modification. If a dev adds a rule and auto-remediation removes it in 60 seconds, they'll be confused. Add clear notifications/documentation.
+
+---
+
+**Q18: You need to implement a "break glass" procedure — in emergencies, specific engineers should be able to bypass MFA and assume a high-privilege role. But this must be auditable and time-limited. How do you design this securely?**
+
+**A:**
+
+**Break-glass IAM architecture:**
+```
+Normal access path (daily):
+  Engineer → MFA → limited-role (read-only + deploy)
+
+Break-glass path (emergency only):
+  Engineer → MFA bypass → break-glass-role (admin)
+  Triggers: PagerDuty alert, immediate notification to security team
+  Auto-expires: 1 hour max session
+  Full audit: every action logged and reviewed
+```
+
+**Implementation:**
+```json
+// Break-glass role trust policy
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "AWS": [
+        "arn:aws:iam::123456:user/sre-lead-1",
+        "arn:aws:iam::123456:user/sre-lead-2"
+      ]
+    },
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      // NO MFA condition (that's the point of break-glass)
+      // But limit source IPs to corporate VPN
+      "IpAddress": {"aws:SourceIp": ["203.0.113.0/24"]}
+    }
+  }]
+}
+
+// Role configuration
+{
+  "MaxSessionDuration": 3600,  // 1 hour max (auto-expire)
+  "Description": "EMERGENCY ONLY - Break glass role. All usage is audited and reviewed."
+}
+```
+
+**Automated alerting on break-glass usage:**
+```bash
+# CloudWatch Events rule: trigger on break-glass AssumeRole
+aws events put-rule --name "break-glass-alert" \
+  --event-pattern '{
+    "source": ["aws.sts"],
+    "detail-type": ["AWS API Call via CloudTrail"],
+    "detail": {
+      "eventName": ["AssumeRole"],
+      "requestParameters": {
+        "roleArn": ["arn:aws:iam::123456:role/break-glass-admin"]
+      }
+    }
+  }'
+
+# SNS notification to security team + Slack
+aws events put-targets --rule "break-glass-alert" --targets '[
+  {"Id": "security-alert", "Arn": "arn:aws:sns:...:security-team-emergency"},
+  {"Id": "slack-alert", "Arn": "arn:aws:lambda:...:function:slack-notifier"}
+]'
+```
+
+**Post-incident review automation:**
+```bash
+# Lambda triggered after break-glass session ends
+# Generates full report of ALL actions taken during the session
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=Username,AttributeValue=break-glass-admin \
+  --start-time "$SESSION_START" --end-time "$SESSION_END" \
+  --query 'Events[].[EventTime,EventName,Resources]' > break-glass-audit-report.json
+
+# Auto-create Jira ticket for security review
+curl -X POST "https://company.atlassian.net/rest/api/3/issue" \
+  -d '{"fields":{"summary":"Break-glass used by '$USER' — review required","issuetype":{"name":"Security Review"}}}'
+```
+
+**Tricky**: Break-glass without MFA seems contradictory to security, but the trade-off is: during a critical production incident, a 30-second MFA delay (finding phone, opening app, entering code) can cost real money and customer trust. The mitigation is: very limited set of users (2-3 SRE leads), immediate alerting, automatic session expiry, mandatory post-incident review. Some companies implement "two-person rule" — break-glass requires two engineers to approve simultaneously (using Step Functions with parallel approval tokens).
+
+---

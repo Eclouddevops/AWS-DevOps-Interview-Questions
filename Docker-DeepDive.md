@@ -698,3 +698,229 @@ signal.signal(signal.SIGTERM, lambda *args: sys.exit(0))
 ```
 
 **Tricky**: Shell form `CMD python app.py` → PID 1 is `/bin/sh`, python is PID 2. SIGTERM goes to `sh` which doesn't forward it. Python never gets shutdown signal → hard killed after timeout. Always use exec form OR tini.
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q21: Your production container runs fine for 48 hours then starts throwing "too many open files" errors and eventually crashes. Memory and CPU look normal. What's happening and how do you debug it in a running container?**
+
+**A:**
+
+**Root cause: File descriptor leak**
+```bash
+# Check current open file descriptors inside the container
+docker exec production-container sh -c "ls /proc/1/fd | wc -l"
+# If this number grows steadily = FD leak
+
+# See WHAT files are open
+docker exec production-container sh -c "ls -la /proc/1/fd" | tail -20
+# Look for: sockets (socket:[12345]), pipes, deleted files
+
+# Check ulimits inside container
+docker exec production-container sh -c "cat /proc/1/limits" | grep "open files"
+# Default: 1048576 (1M) — if you're hitting this, massive leak
+
+# Real-time monitoring of FD count
+docker exec production-container sh -c "while true; do echo \$(date): \$(ls /proc/1/fd | wc -l); sleep 60; done"
+```
+
+**Common FD leak causes in production:**
+```
+1. HTTP connections not closed (missing response.Body.Close() in Go)
+2. Database connections opened but not returned to pool
+3. File handles opened for logging but never closed on rotation
+4. WebSocket connections accumulating (no cleanup on disconnect)
+5. Spawned child processes that become zombies (hold FDs)
+```
+
+**Fix without restarting:**
+```bash
+# Temporary: Increase ulimits (if possible with docker update)
+docker update --ulimit nofile=2097152:2097152 production-container
+
+# Long-term: Set proper ulimits in docker-compose/k8s
+# docker-compose.yml:
+services:
+  app:
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+# Kubernetes:
+securityContext:
+  # Can't set ulimits directly — use init container:
+initContainers:
+- name: sysctl-init
+  image: busybox
+  command: ['sh', '-c', 'ulimit -n 65536']
+  securityContext:
+    privileged: true
+```
+
+**Tricky**: Docker's default file descriptor limit is very high (1M+). If you're hitting it, you have a severe leak — probably thousands of unclosed connections. The fix isn't increasing limits, it's fixing the leak. Also, `docker exec ls /proc/1/fd` shows FDs for PID 1 inside the container. If your app uses `exec` form in ENTRYPOINT (recommended), PID 1 IS your app. If using shell form, PID 1 is `/bin/sh` and your app is a child process — check its PID's FDs instead.
+
+---
+
+**Q22: You need to run Docker-in-Docker (DinD) for your CI/CD pipeline to build Docker images. Your security team says "absolutely not — it requires privileged mode." What are the alternatives?**
+
+**A:**
+
+**Why DinD with `--privileged` is dangerous:**
+```
+--privileged gives the container:
+- ALL Linux capabilities (CAP_SYS_ADMIN, CAP_NET_ADMIN, etc.)
+- Access to all host devices (/dev/*)
+- Ability to mount host filesystem
+- Ability to load kernel modules
+- Essentially ROOT on the HOST
+
+If CI build is compromised → attacker owns the host machine
+```
+
+**Production-safe alternatives:**
+
+```bash
+# Alternative 1: Kaniko (build images without Docker daemon)
+# Runs as unprivileged container, builds images from Dockerfile
+# Used by: Google, GitLab CI, most Kubernetes-native CI systems
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-image
+spec:
+  template:
+    spec:
+      containers:
+      - name: kaniko
+        image: gcr.io/kaniko-project/executor:latest
+        args:
+        - "--dockerfile=Dockerfile"
+        - "--context=git://github.com/org/repo.git"
+        - "--destination=123456.dkr.ecr.us-east-1.amazonaws.com/myapp:latest"
+        volumeMounts:
+        - name: docker-config
+          mountPath: /kaniko/.docker
+      volumes:
+      - name: docker-config
+        secret:
+          secretName: regcred
+
+# Alternative 2: Buildah (rootless container builds)
+# OCI-compatible, no daemon required
+buildah bud -t myapp:latest .
+buildah push myapp:latest docker://registry.example.com/myapp:latest
+
+# Alternative 3: Docker socket mounting (less privileged than DinD)
+# Mount host's Docker socket — builds happen on HOST Docker
+docker run -v /var/run/docker.sock:/var/run/docker.sock builder-image docker build .
+# RISK: Container can control host's Docker (create privileged containers)
+# Slightly better than DinD but still risky
+
+# Alternative 4: Rootless Docker-in-Docker
+# Docker 20.10+ supports rootless mode
+docker run --privileged=false \
+  -e DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS="-p 0.0.0.0:2375:2375/tcp" \
+  docker:dind-rootless
+# Reduced attack surface but still needs some capabilities
+```
+
+**Best practice for CI image builds:**
+| Method | Security | Speed | Complexity |
+|--------|----------|-------|------------|
+| Kaniko | Excellent (unprivileged) | Moderate | Low |
+| Buildah | Excellent (rootless) | Fast | Low |
+| Docker socket mount | Moderate (host access) | Fastest | Low |
+| DinD privileged | Poor (root on host) | Fast | Low |
+| DinD rootless | Good | Moderate | Medium |
+
+**Tricky**: Kaniko doesn't support all Dockerfile instructions perfectly (e.g., some RUN commands that need specific kernel features). Test your Dockerfiles with Kaniko before adopting. Also, mounting the Docker socket (`/var/run/docker.sock`) is often treated as "safer than DinD" but it's actually MORE dangerous in some ways — a compromised build can `docker run --privileged -v /:/host` and get full host access. At least DinD is isolated to the outer container.
+
+---
+
+**Q23: Your multi-stage Docker build caches are invalidated every time, despite no code changes. Builds take 15 minutes instead of 2 minutes. The Dockerfile hasn't changed. What's busting the cache?**
+
+**A:**
+
+**Common invisible cache busters:**
+```dockerfile
+# Problem 1: COPY with changing metadata
+COPY . /app  # Busts cache if ANY file's timestamp, permissions, or content changes
+# Git clone changes timestamps on every checkout!
+# Fix: Copy specific files, or use .dockerignore
+
+# Problem 2: ARG before FROM
+ARG BUILD_DATE
+FROM node:18  # This is fine
+ARG BUILD_DATE  # Re-declared after FROM
+RUN echo $BUILD_DATE  # Changes every build = cache miss!
+# Fix: Put ARGs that change at the END of Dockerfile
+
+# Problem 3: apt-get update in same layer as install
+RUN apt-get update  # Cache: "apt lists from Jan 1"
+RUN apt-get install -y curl  # Uses cached lists (stale)
+# Actually: apt-get update ITSELF gets cached and returns same result
+# But if layer above changes, this re-runs and gets new lists
+
+# Problem 4: Package lock file changed (CI generated)
+COPY package-lock.json ./  # CI regenerated lock file (different line endings, whitespace)
+RUN npm ci  # Cache busted! 15 min npm install
+# Fix: Ensure lock file is committed and not regenerated in CI
+
+# Problem 5: BuildKit not enabled (no cache mount)
+RUN npm ci  # Downloads everything from scratch each time
+# vs
+RUN --mount=type=cache,target=/root/.npm npm ci  # Reuses downloaded packages
+```
+
+**Debugging cache behavior:**
+```bash
+# See cache status for each step
+DOCKER_BUILDKIT=1 docker build --progress=plain . 2>&1 | grep -E "CACHED|RUN|COPY"
+# Lines showing "CACHED" = cache hit
+# Lines without "CACHED" = rebuilt (find the first non-cached = cache buster)
+
+# Check what changed in the COPY context
+# Compare file checksums between builds:
+find . -type f -exec md5sum {} \; | sort > checksums_build1.txt
+# After next CI run:
+find . -type f -exec md5sum {} \; | sort > checksums_build2.txt
+diff checksums_build1.txt checksums_build2.txt
+# Files that differ = your cache busters
+```
+
+**Proper CI Dockerfile for maximum cache reuse:**
+```dockerfile
+# syntax=docker/dockerfile:1.4
+FROM node:18-alpine AS deps
+WORKDIR /app
+
+# These rarely change — cached for weeks
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefer-offline
+
+FROM deps AS build
+# Source code — changes often but only rebuilds THIS stage
+COPY src/ ./src/
+COPY tsconfig.json ./
+RUN npm run build
+
+FROM node:18-alpine AS production
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+# These NEVER change — fully cached
+USER 1000
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
+```
+
+**Tricky**: In CI (GitHub Actions, Jenkins), each build typically runs on a FRESH machine with no local Docker cache. Without remote cache, every build is from scratch. You MUST configure remote cache for CI: `--cache-from type=registry,ref=myrepo:cache --cache-to type=registry,ref=myrepo:cache,mode=max`. The `mode=max` caches ALL intermediate layers, not just the final image layers. Without `mode=max`, multi-stage build intermediate stages are NOT cached remotely.
+
+---

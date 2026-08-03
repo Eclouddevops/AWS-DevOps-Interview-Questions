@@ -541,3 +541,219 @@ resource "aws_cloudwatch_metric_alarm" "queue_depth" {
 - Scale to zero: When queue is empty (set min capacity = 0)
 
 **Tricky**: `ApproximateNumberOfMessagesVisible` updates every 1-5 minutes (not real-time). For faster scaling, publish a custom metric from your application that tracks actual processing rate.
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q16: Your ALB target group shows all targets as "healthy" but customers report intermittent 503 Service Unavailable errors. ALB access logs confirm 503s being returned. What's causing this?**
+
+**A:**
+
+**ALB 503 causes when targets are healthy:**
+```
+1. ALL TARGETS DEREGISTERING simultaneously:
+   - During deployment, old targets deregister + new targets registering
+   - Brief window where NO healthy targets exist
+   - ALB returns 503 "Service Unavailable"
+   
+2. TARGET GROUP HAS NO REGISTERED TARGETS:
+   - ASG scaled to 0 (scaling policy bug or manual error)
+   - ALB has no targets → 503
+   
+3. CONNECTION DRAINING EXHAUSTED:
+   - Deregistration delay: 300s (default)
+   - During this time, target is "draining" — health check says healthy
+   - But target is refusing new connections → 503 for new requests
+
+4. ALB CAPACITY INSUFFICIENT (rare):
+   - Sudden traffic spike → ALB hasn't scaled internally yet
+   - ALB nodes overwhelmed → returns 503
+   - Usually resolves in 1-5 minutes (ALB auto-scales)
+   - Fix: Pre-warm ALB before expected spikes (contact AWS support)
+
+5. LAMBDA TARGET THROTTLING:
+   - ALB with Lambda target → Lambda throttled → 503
+```
+
+**Debugging:**
+```bash
+# Check ALB access logs for 503 patterns
+aws s3 cp s3://alb-logs/AWSLogs/123456/elasticloadbalancing/us-east-1/2024/01/20/ ./logs/
+zcat *.log.gz | awk '$9 == 503 {print $0}' | head -20
+# Look at: target_status_code vs elb_status_code
+# If target returns 503 → application problem
+# If ELB returns 503 (no target response) → no healthy targets available
+
+# Check target registration timeline
+aws elbv2 describe-target-health --target-group-arn $TG_ARN \
+  --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]'
+
+# Check ASG desired/running counts
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names prod-asg \
+  --query 'AutoScalingGroups[].[DesiredCapacity,Instances[].HealthStatus]'
+```
+
+**Fix for deployment-related 503s:**
+```yaml
+# Use minimum healthy percent + slow start
+TargetGroup:
+  Attributes:
+    slow_start.duration_seconds: 60  # New targets get gradual traffic
+    deregistration_delay.timeout_seconds: 30  # Faster drain (reduce window)
+
+AutoScalingGroup:
+  UpdatePolicy:
+    MinInstancesInService: 2        # Always keep 2 healthy during deploy
+    MaxBatchSize: 1                 # Replace 1 at a time
+    PauseTime: PT5M                 # Wait 5 min between batches
+    WaitOnResourceSignals: true     # Wait for app to signal ready
+```
+
+**Tricky**: ALB health checks and ASG health checks are DIFFERENT! ALB might say "healthy" (HTTP 200 on /health) while ASG says "unhealthy" (EC2 status check failed). Or vice versa. When ALB says healthy but returns 503, check if the target was just deregistered (draining state). During draining, the target still passes health checks (existing connections work) but new connections fail. The 503 window is the gap between "start draining" and "new target is ready."
+
+---
+
+**Q17: Your Auto Scaling Group keeps launching and terminating instances in a loop — scaling up then down every 5 minutes. CloudWatch CPU alarm triggers at 70%, ASG adds instances, CPU drops to 30%, ASG removes instances, CPU goes back to 70%. How do you stop this "flapping"?**
+
+**A:**
+
+**The oscillation problem:**
+```
+T0: 3 instances, CPU avg = 75% → alarm: SCALE UP
+T1: 5 instances launched (total 8), CPU drops to 30%
+T2: Cooldown ends → CPU avg = 30% < 40% → alarm: SCALE DOWN
+T3: 5 instances terminated (back to 3), CPU avg = 75%
+T4: Repeat forever...
+
+This is classic control system oscillation — too aggressive scaling.
+```
+
+**Multi-layered fix:**
+```bash
+# Fix 1: Use Target Tracking instead of Simple/Step scaling
+aws autoscaling put-scaling-policy --auto-scaling-group-name prod-asg \
+  --policy-name cpu-target-tracking \
+  --policy-type TargetTrackingScaling \
+  --target-tracking-configuration '{
+    "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ASGAverageCPUUtilization"
+    },
+    "TargetValue": 60.0,
+    "ScaleInCooldown": 300,
+    "ScaleOutCooldown": 60,
+    "DisableScaleIn": false
+  }'
+# Target tracking automatically handles oscillation
+# Maintains CPU around 60% without aggressive add/remove cycles
+
+# Fix 2: If using step scaling — add proper cooldowns
+# Scale-out cooldown: 60s (respond quickly to load)
+# Scale-in cooldown: 300s (wait before removing — prevent flap)
+
+# Fix 3: Use predictive scaling for known patterns
+aws autoscaling put-scaling-policy --auto-scaling-group-name prod-asg \
+  --policy-name predictive-scaling \
+  --policy-type PredictiveScaling \
+  --predictive-scaling-configuration '{
+    "MetricSpecifications": [{
+      "TargetValue": 60,
+      "PredefinedMetricPairSpecification": {
+        "PredefinedMetricType": "ASGCPUUtilization"
+      }
+    }],
+    "Mode": "ForecastAndScale",
+    "SchedulingBufferTime": 300
+  }'
+```
+
+**Understanding cooldown vs stabilization:**
+```
+COOLDOWN (Simple/Step scaling):
+- After scale-out: ignore alarms for X seconds
+- Prevents: launching too many instances at once
+- Default: 300 seconds
+
+SCALE-IN PROTECTION:
+- Instance can't be terminated for X minutes after launch
+- Prevents: killing instances before they finish bootstrapping
+
+WARM-UP:
+- New instance's metrics excluded from aggregation for X seconds
+- Prevents: new instance (0% CPU) from dragging average down → premature scale-in
+```
+
+**Tricky**: The root cause of flapping is usually that the ASG OVER-PROVISIONS on scale-out. If you need 5 instances at 70% CPU, and scaling adds 5 more (total 10), CPU drops to 35%. Then it removes 5, back to 70%. Fix: use step scaling with smaller steps (add 2, not 5) or target tracking which calculates the exact number needed. Also, `InstanceWarmup` in target tracking policies (default 300s) tells ASG to ignore new instance metrics until warm — without it, a cold instance shows 0% CPU → average drops → premature scale-in.
+
+---
+
+**Q18: You have a microservices architecture with 10 ALBs (one per service). Monthly ALB cost is $3,500. Your manager asks you to reduce networking costs. What are your options?**
+
+**A:**
+
+**Cost breakdown per ALB:**
+```
+ALB hourly charge: $0.0225/hour = $16.20/month
+LCU charges: Based on new connections, active connections, bandwidth, rules
+10 ALBs: $162/month (fixed) + LCU charges (~$3,300)
+
+Main cost is LCU, not hourly charge.
+LCU pricing: $0.008/LCU-hour
+1 LCU = 25 new connections/s OR 3000 active connections OR 1GB/hour
+```
+
+**Cost reduction strategies:**
+```bash
+# Strategy 1: Consolidate ALBs using path-based routing
+# Instead of 10 ALBs, use 1-2 ALBs with listener rules:
+# /api/users/* → user-service target group
+# /api/orders/* → order-service target group
+# /api/payments/* → payment-service target group
+# Savings: 8 ALBs × $16.20 = $130/month + shared LCU efficiency
+
+# Strategy 2: Use NLB for non-HTTP services
+# NLB: $0.006/NLCU-hour (25% cheaper than ALB LCU)
+# For gRPC, TCP, or simple pass-through: NLB is cheaper
+# ALB is only needed for: path routing, host routing, HTTP/2, WAF integration
+
+# Strategy 3: Use API Gateway for low-traffic services
+# API Gateway: $3.50 per million requests
+# If service gets <1M requests/month: API Gateway < ALB
+# Break-even: ~2M requests/month (below this, API GW is cheaper)
+
+# Strategy 4: Kubernetes Ingress Controller (if using EKS)
+# Single ALB + Ingress Controller handles ALL services
+# AWS Load Balancer Controller creates ONE ALB with dynamic rules
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/group.name: shared-alb  # Groups into single ALB!
+spec:
+  rules:
+  - host: users.api.com
+    http:
+      paths:
+      - path: /
+        backend:
+          service:
+            name: user-service
+            port: 
+              number: 80
+```
+
+**Comparison for 10 microservices:**
+| Approach | Monthly Cost | Complexity |
+|----------|-------------|------------|
+| 10 separate ALBs | $3,500 | Low |
+| 2 ALBs (consolidated) | $1,200 | Medium |
+| 1 ALB + Ingress Controller | $800 | Medium |
+| API Gateway (low traffic) | $200-500 | Low |
+
+**Tricky**: Consolidating to fewer ALBs means one ALB handles more services. If that ALB has issues, ALL services are affected (increased blast radius). Production best practice: consolidate by criticality tier. Tier-1 (payment, auth): dedicated ALB. Tier-2 (catalog, search): shared ALB. Tier-3 (internal tools): API Gateway. Also, ALB listener rules are limited to 100 per ALB (default). With 10 services × 10 path rules each = 100 rules. Request increase if needed.
+
+---

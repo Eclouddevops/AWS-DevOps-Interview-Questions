@@ -731,3 +731,240 @@ pluto detect-files -d ./manifests/
 # API server metrics
 kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
 ```
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q21: A penetration tester reports they can exec into any pod from a compromised pod in the same namespace. Your NetworkPolicies are in place. How is this possible?**
+
+**A:**
+
+**Why NetworkPolicies don't prevent `kubectl exec`:**
+```
+NetworkPolicies control NETWORK traffic between pods (Layer 3/4).
+kubectl exec goes through the API SERVER, not pod-to-pod networking:
+
+Compromised Pod → API Server (HTTPS/443) → Kubelet → Target Pod
+
+NetworkPolicy CANNOT block this because:
+1. It's not pod-to-pod traffic — it's pod → API server → kubelet
+2. The attacker used the pod's ServiceAccount token to call the API
+3. The ServiceAccount has RBAC permissions to exec into pods
+```
+
+**How the attack works:**
+```bash
+# Inside compromised pod, attacker finds the ServiceAccount token:
+cat /var/run/secrets/kubernetes.io/serviceaccount/token
+
+# Uses it to call the API server:
+APISERVER=https://kubernetes.default.svc
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "$APISERVER/api/v1/namespaces/default/pods/target-pod/exec?command=sh&stdin=true&stdout=true"
+```
+
+**Fix (defense in depth):**
+```yaml
+# Fix 1: Disable automatic ServiceAccount token mounting
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-app
+automountServiceAccountToken: false  # Don't mount token unless needed
+
+# Fix 2: Use RBAC to restrict exec permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: no-exec-role
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]  # NO "create" on pods/exec
+# Explicitly NOT granting: resources: ["pods/exec"] verbs: ["create"]
+
+# Fix 3: Admission controller to block exec in production
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sBlockExec
+metadata:
+  name: block-exec-production
+spec:
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Pod"]
+    namespaces: ["production"]
+  parameters:
+    allowedServiceAccounts: ["sre-admin"]  # Only SRE can exec
+
+# Fix 4: Audit logging for exec events
+# Enable in kube-apiserver audit policy:
+- level: RequestResponse
+  resources:
+  - group: ""
+    resources: ["pods/exec", "pods/attach"]
+  # This logs WHO exec'd into WHICH pod and WHEN
+```
+
+**Tricky**: Most teams think NetworkPolicies = complete isolation. They don't. NetworkPolicies only control east-west traffic between pods. For API-level access control, you need RBAC + admission webhooks + audit logging. The most overlooked attack vector: default ServiceAccount in `default` namespace often has excessive permissions. Always create dedicated ServiceAccounts with minimal RBAC per application.
+
+---
+
+**Q22: You're upgrading EKS from 1.27 to 1.28. Post-upgrade, your admission webhooks start timing out and new pods can't be created. The cluster is effectively frozen. What happened?**
+
+**A:**
+
+**Root cause:**
+```
+During EKS control plane upgrade:
+1. API server restarts with new version
+2. Admission webhook endpoints (running IN the cluster) are briefly unreachable
+3. If webhook has failurePolicy: Fail → ALL pod creation blocked
+4. Webhook pods themselves can't restart (chicken-and-egg!)
+5. Cluster is FROZEN — nothing can be created, updated, or deleted
+
+Timeline:
+- API server restarts → tries to create system pods
+- System pod creation → calls webhook → webhook pod is down → FAIL
+- Webhook pod can't restart → needs admission → admission is broken
+- DEADLOCK!
+```
+
+**Immediate fix:**
+```bash
+# Option 1: Delete the webhook configuration (emergency)
+kubectl delete validatingwebhookconfigurations my-webhook
+kubectl delete mutatingwebhookconfigurations my-webhook
+# Pods can now be created → webhook pods restart → re-apply webhook config
+
+# Option 2: Patch to ignore failures temporarily
+kubectl patch validatingwebhookconfigurations my-webhook \
+  --type='json' -p='[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]'
+```
+
+**Prevention (production-ready webhook config):**
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: my-webhook
+webhooks:
+- name: validate.myapp.io
+  failurePolicy: Ignore        # NEVER use "Fail" for non-critical webhooks
+  timeoutSeconds: 5             # Short timeout (default 10s is too long)
+  reinvocationPolicy: Never
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values: ["kube-system", "kube-node-lease"]  # Don't intercept system namespaces!
+  objectSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: "helm"  # Only intercept specific resources
+  rules:
+  - apiGroups: ["apps"]
+    apiVersions: ["v1"]
+    resources: ["deployments"]
+    operations: ["CREATE", "UPDATE"]
+    scope: "Namespaced"
+```
+
+**Tricky**: The #1 rule for admission webhooks in production: NEVER set `failurePolicy: Fail` on a webhook that runs INSIDE the cluster it's protecting. If the webhook pod goes down (upgrade, OOM, node failure), the entire cluster freezes. Use `failurePolicy: Ignore` and add alerting for webhook failures instead. If you MUST use `Fail` (compliance requirement), run the webhook OUTSIDE the cluster (separate EKS cluster or Lambda-based webhook).
+
+---
+
+**Q23: Your security scan reveals that 40% of pods in production are running as root. The development team says "our apps need root." How do you enforce non-root without breaking applications?**
+
+**A:**
+
+**Discovery phase:**
+```bash
+# Find all pods running as root
+kubectl get pods --all-namespaces -o json | jq -r '
+  .items[] | select(
+    .spec.containers[].securityContext.runAsUser == 0 or
+    (.spec.containers[].securityContext.runAsUser == null and .spec.securityContext.runAsUser == null)
+  ) | "\(.metadata.namespace)/\(.metadata.name)"'
+
+# Check WHY they "need" root (usually they don't):
+# Common false claims:
+# - "We need root to bind port 80" → Use port 8080 + Service mapping
+# - "We need root to read /etc/ssl" → Fix file permissions in Dockerfile
+# - "We need root for apt-get" → Build-time only, not runtime
+# - "We need root for log files" → Fix directory permissions
+```
+
+**Gradual enforcement strategy:**
+```yaml
+# Phase 1: AUDIT (warn but don't block) — 2 weeks
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sPSPAllowedUsers
+metadata:
+  name: must-run-as-nonroot-audit
+spec:
+  enforcementAction: warn  # Only warn, don't block
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "monitoring"]
+  parameters:
+    runAsUser:
+      rule: MustRunAsNonRoot
+
+# Phase 2: DRY-RUN (reject but only in dry-run) — 2 weeks
+  enforcementAction: dryrun
+
+# Phase 3: ENFORCE (actually block) — after teams fix their images
+  enforcementAction: deny
+```
+
+**How to fix "needs root" containers:**
+```dockerfile
+# BEFORE (runs as root):
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y nginx
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+
+# AFTER (runs as non-root):
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y nginx \
+    && chown -R 1000:1000 /var/log/nginx /var/run /var/cache/nginx \
+    && sed -i 's/listen 80/listen 8080/' /etc/nginx/sites-available/default
+USER 1000
+EXPOSE 8080
+CMD ["nginx", "-g", "daemon off;"]
+
+# Kubernetes Service maps port 80 → container port 8080
+---
+apiVersion: v1
+kind: Service
+spec:
+  ports:
+  - port: 80           # External-facing
+    targetPort: 8080   # Container (non-privileged port)
+```
+
+**Pod Security Standards (Kubernetes native — no Gatekeeper needed):**
+```yaml
+# Apply to namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted    # Block violations
+    pod-security.kubernetes.io/audit: restricted      # Log violations
+    pod-security.kubernetes.io/warn: restricted       # Warn on violations
+```
+
+**Tricky**: The "restricted" Pod Security Standard blocks: running as root, privilege escalation, host namespaces, host paths, and all capabilities. This breaks most legacy applications. Start with "baseline" (blocks only obviously dangerous things like privileged mode and hostNetwork), then work toward "restricted" over months. Also, init containers often legitimately need elevated privileges (setting sysctls, fixing permissions). Use `spec.initContainers[].securityContext` separately from main containers.
+
+---

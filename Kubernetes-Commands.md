@@ -776,3 +776,175 @@ kubectl exec other-pod -- curl backend-pod:8080     # Should fail
 - Use `kubectl explain networkpolicy.spec.ingress` to check field names
 - Always specify BOTH Ingress and Egress in `policyTypes` if you want to restrict both
 - Don't forget DNS egress (port 53 UDP+TCP) or pods can't resolve service names!
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q21: You need to find all pods that are consuming more than 80% of their memory limit across the entire cluster. Write the kubectl command and explain what you'd do with the results.**
+
+**A:**
+
+```bash
+# Method 1: Using kubectl top + custom processing
+kubectl top pods --all-namespaces --no-headers | while read ns name cpu mem; do
+  # Get memory limit for each pod
+  LIMIT=$(kubectl get pod "$name" -n "$ns" -o jsonpath='{.spec.containers[0].resources.limits.memory}' 2>/dev/null)
+  if [ -n "$LIMIT" ]; then
+    # Convert to Mi for comparison
+    USAGE_MI=$(echo "$mem" | sed 's/Mi//')
+    LIMIT_MI=$(echo "$LIMIT" | sed 's/Mi//; s/Gi/*1024/' | bc)
+    if [ "$USAGE_MI" -gt 0 ] && [ "$LIMIT_MI" -gt 0 ]; then
+      PCT=$((USAGE_MI * 100 / LIMIT_MI))
+      if [ "$PCT" -gt 80 ]; then
+        echo "WARNING: $ns/$name using ${PCT}% of memory limit ($mem / $LIMIT)"
+      fi
+    fi
+  fi
+done
+
+# Method 2: One-liner with custom-columns + sorting
+kubectl top pods -A --sort-by=memory --no-headers | head -20
+
+# Method 3: Using Prometheus query (production approach)
+# container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.8
+```
+
+**What to do with results:**
+```bash
+# 1. Check if pods are about to OOMKill
+kubectl describe pod high-memory-pod -n prod | grep -A5 "Last State"
+# If "OOMKilled" in history → memory leak or undersized limit
+
+# 2. Get memory growth trend
+kubectl exec -n monitoring prometheus-0 -- promtool query instant \
+  'rate(container_memory_usage_bytes{pod="high-memory-pod"}[1h])'
+
+# 3. Right-size or restart
+# If growing steadily → memory leak → restart as temporary fix
+kubectl rollout restart deployment/leaky-service -n prod
+
+# If stable at 80% → increase limit (with 25% headroom)
+kubectl patch deployment myservice -n prod -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"myservice","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+```
+
+**Tricky**: `kubectl top` shows CURRENT usage, not peak. A pod showing 50% now might spike to 95% during peak hours. For proper capacity planning, use Prometheus `container_memory_usage_bytes` with `max_over_time(... [7d])` to see the 7-day peak. Also, `kubectl top` shows working set memory (RSS + cache), while OOMKill triggers on RSS only in some kernel versions. The numbers might not match exactly.
+
+---
+
+**Q22: A node is NotReady and you need to safely move all workloads off it without losing any in-progress work. Walk through the complete drain procedure with all edge cases.**
+
+**A:**
+
+```bash
+# Step 1: Investigate WHY it's NotReady (before draining)
+kubectl describe node problem-node | grep -A 10 "Conditions"
+# MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable?
+
+# Step 2: Cordon first (prevent new scheduling)
+kubectl cordon problem-node
+# Node is now SchedulingDisabled — no new pods will land here
+
+# Step 3: Check what's running on the node
+kubectl get pods --all-namespaces --field-selector spec.nodeName=problem-node
+# Note: DaemonSets, StatefulSets, pods with local storage, pods without PDB
+
+# Step 4: Drain with safety flags
+kubectl drain problem-node \
+  --ignore-daemonsets \           # Don't try to evict DaemonSet pods
+  --delete-emptydir-data \        # Allow deletion of pods using emptyDir
+  --grace-period=120 \            # Give pods 2 minutes to shutdown gracefully
+  --timeout=600 \                 # Wait max 10 minutes for drain to complete
+  --pod-selector='app!=critical-singleton'  # Skip specific pods if needed
+
+# Step 5: If drain is stuck (common!)
+kubectl get pods --field-selector spec.nodeName=problem-node
+# PodDisruptionBudget might be blocking eviction
+
+# Check PDB status
+kubectl get pdb --all-namespaces
+# If PDB says "Allowed disruptions: 0" → drain is blocked
+```
+
+**Edge cases that block drain:**
+```bash
+# Case 1: PDB with maxUnavailable=0 or minAvailable=100%
+# Fix: Temporarily relax PDB
+kubectl patch pdb my-pdb -p '{"spec":{"maxUnavailable": 1}}'
+
+# Case 2: Pod with no controller (bare pod)
+# kubectl drain won't evict pods not managed by ReplicaSet/Deployment
+# Fix: Use --force flag (pod will be deleted, not rescheduled!)
+kubectl drain problem-node --force
+
+# Case 3: Local PersistentVolume
+# Pod using hostPath or local PV can't be rescheduled elsewhere
+# Fix: Handle manually — backup data, delete pod, recreate on new node
+
+# Case 4: StatefulSet pod with "ordinal stuck"
+# Pod redis-2 won't be recreated until redis-2 is fully terminated
+# If termination takes long (finalizer stuck): patch to remove finalizer
+kubectl patch pod redis-2 -p '{"metadata":{"finalizers":null}}'
+
+# Case 5: Pods in Terminating state (stuck)
+kubectl get pods --field-selector spec.nodeName=problem-node,status.phase=Running
+# Force delete stuck terminating pods:
+kubectl delete pod stuck-pod --grace-period=0 --force
+```
+
+**Tricky**: `kubectl drain` respects PodDisruptionBudgets (PDB). If a PDB says "minimum 2 pods must be available" and only 2 pods exist, drain CANNOT evict — it will hang forever. Before draining, always check: (1) Are there enough replicas across other nodes? (2) Is the PDB configured to allow disruption? (3) Are there bare pods without controllers? A common production mistake: setting `minAvailable: 100%` which prevents ALL voluntary disruptions including drains and upgrades.
+
+---
+
+**Q23: Your team needs to quickly identify all resources (pods, services, configmaps, secrets) associated with a specific application across all namespaces. The label `app=payment-service` is used but not consistently. How do you find everything?**
+
+**A:**
+
+```bash
+# Method 1: Label-based search (finds labeled resources)
+kubectl get all,configmap,secret,pvc,ingress,networkpolicy,serviceaccount \
+  --all-namespaces -l app=payment-service
+
+# Method 2: Name-based search (finds resources by naming convention)
+kubectl get all --all-namespaces | grep -i payment
+kubectl get configmap --all-namespaces | grep -i payment
+kubectl get secret --all-namespaces | grep -i payment
+kubectl get ingress --all-namespaces | grep -i payment
+
+# Method 3: Find by owner references (follow the chain)
+# Deployment → ReplicaSet → Pods
+DEPLOY=$(kubectl get deploy -A -l app=payment-service -o name)
+kubectl get rs -A -o json | jq -r ".items[] | select(.metadata.ownerReferences[]?.name == \"payment-service\") | .metadata.name"
+
+# Method 4: Using kubectl-tree plugin (shows resource hierarchy)
+kubectl tree deployment payment-service -n production
+# Output:
+# NAMESPACE    NAME                                    READY
+# production   Deployment/payment-service              True
+# production   ├── ReplicaSet/payment-service-abc123   True
+# production   │   ├── Pod/payment-service-abc123-x1   True
+# production   │   └── Pod/payment-service-abc123-x2   True
+# production   └── ReplicaSet/payment-service-old456   False
+
+# Method 5: Find all resources that REFERENCE this service
+# Find ConfigMaps/Secrets mounted by the pods
+kubectl get pod -n production -l app=payment-service -o json | \
+  jq -r '.items[].spec | 
+    (.volumes[]? | select(.configMap) | "ConfigMap: " + .configMap.name),
+    (.volumes[]? | select(.secret) | "Secret: " + .secret.secretName),
+    (.containers[].envFrom[]? | select(.configMapRef) | "ConfigMap: " + .configMapRef.name),
+    (.containers[].envFrom[]? | select(.secretRef) | "Secret: " + .secretRef.name)'
+
+# Method 6: Full audit with Helm (if Helm-managed)
+helm list -A | grep payment
+helm get all payment-service -n production  # Shows ALL resources managed by this release
+```
+
+**Tricky**: `kubectl get all` does NOT actually get ALL resources. It only returns: pods, services, deployments, replicasets, statefulsets, daemonsets, jobs, cronjobs. It MISSES: configmaps, secrets, PVCs, ingresses, networkpolicies, serviceaccounts, roles, rolebindings, HPAs, and custom resources. For a complete inventory, you must explicitly list resource types or use `kubectl api-resources --verbs=list -o name | xargs -I {} kubectl get {} -A -l app=payment-service`.
+
+---

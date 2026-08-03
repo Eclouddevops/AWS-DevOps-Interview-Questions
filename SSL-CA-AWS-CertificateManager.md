@@ -3704,3 +3704,195 @@ echo "  openssl s_client -connect app.${DOMAIN}:443 -servername app.${DOMAIN}"
 ```
 
 **Tricky**: For internal/private CA certificates, clients must trust your CA root. Distribute `ca.crt` to all clients, or add it to the OS trust store: `sudo cp ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates` (Ubuntu) or `sudo cp ca.crt /etc/pki/ca-trust/source/anchors/ && sudo update-ca-trust` (Amazon Linux/RHEL).
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q51: Your ACM certificate auto-renewal failed silently. You only discovered it when users started getting "certificate expired" errors in production. How did this happen and how do you prevent it?**
+
+**A:**
+
+**Why ACM auto-renewal fails:**
+```
+ACM auto-renews certificates 60 days before expiry. But it can FAIL silently:
+
+1. DNS VALIDATION RECORD DELETED:
+   - ACM DNS-validated cert requires CNAME record in Route 53/DNS
+   - Someone deleted the _acme-challenge CNAME record
+   - ACM can't validate ownership → renewal fails
+   - No alarm by default!
+
+2. EMAIL VALIDATION + EMAIL NOT MONITORED:
+   - Certificate uses email validation
+   - Renewal email sent to admin@domain.com
+   - Nobody checks that inbox → approval expires → cert expires
+
+3. DOMAIN EXPIRED OR TRANSFERRED:
+   - Domain registration expired → DNS no longer resolves
+   - ACM can't validate → renewal fails
+
+4. CAA RECORD BLOCKING:
+   - DNS CAA record restricts which CAs can issue for domain
+   - CAA says: "only letsencrypt.org allowed"
+   - ACM (Amazon CA) blocked by CAA → renewal fails
+```
+
+**Detection and prevention:**
+```bash
+# Check certificate status
+aws acm describe-certificate --certificate-arn arn:aws:acm:...:cert/xxx \
+  --query '{Status:Status,RenewalSummary:RenewalSummary,NotAfter:NotAfter}'
+
+# List all certificates expiring within 30 days
+aws acm list-certificates --query 'CertificateSummaryList[?NotAfter<`2024-02-20`]'
+
+# Set up CloudWatch alarm for certificate expiry
+aws cloudwatch put-metric-alarm --alarm-name "ACM-Cert-Expiry" \
+  --namespace "AWS/CertificateManager" \
+  --metric-name "DaysToExpiry" \
+  --dimensions Name=CertificateArn,Value=arn:aws:acm:...:cert/xxx \
+  --threshold 30 --comparison-operator LessThanThreshold \
+  --evaluation-periods 1 --period 86400 --statistic Minimum \
+  --alarm-actions arn:aws:sns:...:cert-alerts
+
+# AWS Config rule to monitor renewal status
+aws configservice put-config-rule --config-rule '{
+  "ConfigRuleName": "acm-certificate-expiration-check",
+  "Source": {"Owner": "AWS", "SourceIdentifier": "ACM_CERTIFICATE_EXPIRATION_CHECK"},
+  "InputParameters": "{\"daysToExpiration\": \"30\"}"
+}'
+```
+
+**Tricky**: ACM `DaysToExpiry` CloudWatch metric ONLY exists for certificates that are IN USE (attached to ALB/CloudFront/etc.). If you have a certificate that's not attached to any resource, there's NO metric — you won't get an alarm. Also, ACM DNS validation records must exist for the LIFETIME of the certificate, not just during initial creation. Many teams delete the CNAME after initial validation thinking it's no longer needed — this breaks auto-renewal.
+
+---
+
+**Q52: You need to migrate from a third-party SSL certificate (DigiCert) to ACM for your production ALB. The cutover must have zero downtime. How do you do this?**
+
+**A:**
+
+**Migration strategy:**
+```bash
+# Step 1: Request new ACM certificate (while old cert still valid)
+aws acm request-certificate --domain-name "api.company.com" \
+  --subject-alternative-names "*.company.com" \
+  --validation-method DNS
+
+# Step 2: Validate (add CNAME records)
+aws acm describe-certificate --certificate-arn $NEW_CERT_ARN \
+  --query 'Certificate.DomainValidationOptions[].ResourceRecord'
+# Add the CNAME records to DNS → wait for validation (5-30 min)
+
+# Step 3: Test with the new cert BEFORE switching production
+# Create a test ALB listener with the new cert
+aws elbv2 create-listener --load-balancer-arn $TEST_ALB \
+  --protocol HTTPS --port 8443 \
+  --certificates CertificateArn=$NEW_CERT_ARN \
+  --default-actions Type=forward,TargetGroupArn=$TG
+# Test: curl -v https://test-alb:8443 → verify cert chain is correct
+
+# Step 4: Switch production ALB to new cert (INSTANT, no downtime)
+aws elbv2 modify-listener --listener-arn $PROD_LISTENER \
+  --certificates CertificateArn=$NEW_CERT_ARN
+# This is ATOMIC — existing connections continue with old cert
+# New connections use new cert — zero interruption
+
+# Step 5: Verify
+openssl s_client -connect api.company.com:443 -servername api.company.com 2>/dev/null | \
+  openssl x509 -noout -issuer -dates
+# Should show Amazon CA, not DigiCert
+```
+
+**Rollback plan:**
+```bash
+# If something is wrong with new cert → switch back instantly
+aws elbv2 modify-listener --listener-arn $PROD_LISTENER \
+  --certificates CertificateArn=$OLD_CERT_ARN
+# Takes effect in <1 second for new connections
+```
+
+**Tricky**: ALB supports MULTIPLE certificates on the same listener using SNI (Server Name Indication). You can add both old and new certificates simultaneously — ALB will serve the correct one based on the client's requested hostname. This means you can test the new cert without removing the old one. Also, existing TCP connections are NOT affected by certificate changes — only new TLS handshakes use the new cert. Active sessions continue until they naturally close.
+
+---
+
+**Q53: Your application uses mutual TLS (mTLS) — the server verifies the client's certificate. After deploying a new server certificate, all client connections fail with "certificate verify failed." The new server cert is valid. What went wrong?**
+
+**A:**
+
+**mTLS certificate chain issue:**
+```
+Normal TLS: Client verifies Server cert → connection established
+Mutual TLS: Client verifies Server cert AND Server verifies Client cert
+
+The problem:
+- You replaced the SERVER certificate
+- The new server cert is issued by a DIFFERENT CA
+- The server's truststore (CA bundle for verifying clients) wasn't updated
+- OR: The new server cert doesn't include intermediate CA certs
+- Client can't build complete chain → verification fails
+```
+
+**Common causes:**
+```
+1. INTERMEDIATE CERTIFICATE MISSING:
+   Server sends: leaf cert only
+   Client needs: leaf + intermediate + root (complete chain)
+   Fix: Include full chain in server config
+   
+2. CLIENT CA BUNDLE NOT UPDATED:
+   Old server trusted: DigiCert Root CA (for client certs)
+   New server trusts: Amazon Root CA (wrong CA for client certs!)
+   Client presents cert signed by DigiCert → server rejects
+   
+3. CERTIFICATE ORDER WRONG:
+   Server sends: [intermediate, leaf] instead of [leaf, intermediate]
+   Some clients handle this, others fail
+   
+4. SNI MISMATCH:
+   Client sends SNI: api.company.com
+   Server has cert for: *.company.com (wildcard)
+   Some strict mTLS implementations reject wildcard for SNI match
+```
+
+**Debugging:**
+```bash
+# Test server cert chain
+openssl s_client -connect server:443 -servername api.company.com
+# Look for: "Verify return code: 0 (ok)"
+# If not 0 → chain issue
+
+# Test mTLS with client cert
+openssl s_client -connect server:443 \
+  -cert client.crt -key client.key -CAfile server-ca-bundle.crt
+# Should show: "Acceptable client certificate CA names" 
+# Verify your client cert's CA is in that list
+
+# Check complete chain from server
+openssl s_client -connect server:443 -showcerts 2>/dev/null | \
+  awk '/BEGIN CERT/,/END CERT/{print}' | \
+  openssl x509 -noout -subject -issuer
+# Each cert's issuer should match next cert's subject
+```
+
+**Fix:**
+```bash
+# Ensure server sends complete chain:
+# nginx:
+ssl_certificate /etc/ssl/fullchain.pem;  # leaf + intermediate(s)
+ssl_certificate_key /etc/ssl/private.key;
+ssl_client_certificate /etc/ssl/client-ca-bundle.pem;  # CAs that can sign client certs
+ssl_verify_client on;
+
+# Create fullchain:
+cat server.crt intermediate.crt > fullchain.pem
+# Order: leaf first, then intermediate(s), root NOT included
+```
+
+**Tricky**: In mTLS, you have TWO trust stores: (1) The CLIENT's trust store verifies the server's identity (contains server CA), (2) The SERVER's trust store verifies the client's identity (contains client CA). When you replace the server cert, you might accidentally change the server's CA configuration, which affects client certificate verification — even though the server's own cert is perfectly valid. Always test mTLS changes end-to-end before production cutover.
+
+---

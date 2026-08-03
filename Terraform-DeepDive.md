@@ -845,3 +845,241 @@ terraform apply -replace="aws_instance.web"
 5. `-replace` works with plan files: `terraform plan -replace="aws_instance.web" -out=plan.tfplan`
 
 **Tricky**: If you `taint` a resource and someone else runs `apply` before you, THEY destroy and recreate it (surprise!). `-replace` avoids this because it's specified at plan/apply time.
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q21: You ran `terraform apply` and it created half the resources, then failed on one resource. Now your state is partially applied. Some resources exist in AWS, some don't, and the state file is a mess. How do you recover?**
+
+**A:**
+
+**Understanding partial apply:**
+```
+Terraform applies resources in dependency order.
+If resource #7 out of 15 fails:
+- Resources 1-6: Created in AWS ✓, recorded in state ✓
+- Resource 7: May or may not exist in AWS, may or may not be in state
+- Resources 8-15: Not created, not in state
+
+Your state IS consistent for resources 1-6.
+The problem is resource 7 (potentially inconsistent).
+```
+
+**Recovery procedure:**
+```bash
+# Step 1: Check current state vs reality
+terraform plan
+# This will show you what Terraform THINKS vs what EXISTS
+# It should show: resources 8-15 will be created, resource 7 depends on situation
+
+# Step 2: Handle the failed resource (#7)
+# Case A: Resource was created in AWS but NOT recorded in state
+# → Import it
+terraform import aws_rds_instance.main prod-database-instance
+
+# Case B: Resource was NOT created in AWS but IS in state (rare)
+# → Remove from state
+terraform state rm aws_rds_instance.main
+
+# Case C: Resource was partially created (e.g., security group without rules)
+# → Let terraform apply fix it (it will detect drift and update)
+
+# Step 3: Re-run apply (idempotent — won't recreate existing resources)
+terraform apply
+# Resources 1-6: "No changes"
+# Resource 7: "Update in-place" or "Create" (depending on Case A/B/C)
+# Resources 8-15: "Create"
+```
+
+**Prevention:**
+```hcl
+# Use -target for risky resources (apply in stages)
+terraform apply -target=aws_vpc.main -target=aws_subnet.private
+terraform apply -target=aws_rds_instance.main  # Apply DB separately
+terraform apply  # Apply remaining
+
+# Use create_before_destroy for zero-downtime
+lifecycle {
+  create_before_destroy = true
+}
+
+# Use precondition/postcondition (Terraform 1.2+)
+resource "aws_instance" "web" {
+  lifecycle {
+    precondition {
+      condition     = data.aws_ami.latest.id != ""
+      error_message = "AMI not found — aborting before partial apply"
+    }
+  }
+}
+```
+
+**Tricky**: Terraform's apply is NOT atomic. There's no transaction rollback. If resource 7 fails, resources 1-6 remain. This is why `terraform plan -out=plan.tfplan` followed by `terraform apply plan.tfplan` is critical — you validate the EXACT plan before applying. Also, some resources have long creation times (RDS: 10+ min, CloudFront: 15+ min). A timeout during creation means the resource may actually be created but Terraform lost connection. Always check AWS Console before assuming "not created."
+
+---
+
+**Q22: Two team members ran `terraform apply` simultaneously (DynamoDB locking wasn't configured). Now the state file shows a resource that was deleted by Team A but Team B's apply still references it. How do you untangle this?**
+
+**A:**
+
+**The double-apply disaster:**
+```
+Timeline:
+T0: Both read same state (resource X exists)
+T1: Team A deletes resource X, updates state (X removed)
+T2: Team B's apply tries to modify resource X
+T3: Team B gets error: "resource not found" 
+T4: Team B's apply partially fails, state is corrupted
+    State says X exists (Team B's stale copy) but it doesn't in AWS
+```
+
+**Recovery:**
+```bash
+# Step 1: STOP everyone from running Terraform
+# Communicate to team: "State corruption — nobody touch Terraform"
+
+# Step 2: Pull the latest state
+terraform state pull > current_state.json
+cat current_state.json | jq '.resources[] | .type + "." + .name'
+
+# Step 3: Identify ghost resources (in state but not in AWS)
+terraform plan
+# Resources that show "will be destroyed" but you didn't intend to destroy
+# OR resources that show error "not found" during refresh
+
+# Step 4: Remove ghost resources from state
+terraform state rm aws_instance.deleted_by_team_a
+terraform state rm aws_security_group.deleted_by_team_a
+
+# Step 5: Import any resources that exist in AWS but not in state
+terraform import aws_instance.new_one i-0abc123def
+
+# Step 6: Verify clean state
+terraform plan
+# Should show only INTENDED changes (no ghosts, no surprises)
+
+# Step 7: NOW configure locking (prevent recurrence)
+```
+
+**Proper locking setup:**
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "company-tf-state"
+    key            = "prod/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "terraform-locks"  # THIS prevents concurrent access
+  }
+}
+
+# DynamoDB table for locking
+resource "aws_dynamodb_table" "terraform_locks" {
+  name         = "terraform-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+}
+```
+
+**Tricky**: Even WITH locking, if someone uses `terraform force-unlock` incorrectly (lock was legitimate, not stale), they can cause the same concurrent apply issue. Also, `terraform refresh` (implicit in plan/apply) can itself update state based on what it finds in AWS. If Team A deleted a resource and Team B runs `terraform plan`, the refresh step will notice the resource is gone and UPDATE the state to remove it — but only if Team B's code still references it, Terraform will then try to recreate it. Understanding this refresh behavior is key to debugging state issues.
+
+---
+
+**Q23: Your Terraform module is used by 20 teams. You need to make a breaking change (rename a variable). How do you do this without breaking all 20 teams simultaneously?**
+
+**A:**
+
+**The breaking change problem:**
+```hcl
+# Current module interface (used by 20 teams):
+module "vpc" {
+  source      = "git::https://github.com/company/tf-modules//vpc?ref=v2.0.0"
+  vpc_cidr    = "10.0.0.0/16"  # ← This variable name needs to change
+  subnet_bits = 8
+}
+
+# You want to rename: vpc_cidr → cidr_block (more consistent)
+# If you just rename it → 20 teams' configs break on next terraform init
+```
+
+**Backward-compatible migration strategy:**
+```hcl
+# Step 1: Add new variable, keep old one (v2.1.0 — non-breaking)
+variable "cidr_block" {
+  description = "VPC CIDR block (preferred)"
+  type        = string
+  default     = null
+}
+
+variable "vpc_cidr" {
+  description = "DEPRECATED: Use cidr_block instead"
+  type        = string
+  default     = null
+}
+
+locals {
+  # Use new variable if set, fall back to old
+  actual_cidr = coalesce(var.cidr_block, var.vpc_cidr)
+}
+
+# Validation: at least one must be set
+variable "validate_cidr" {
+  type    = string
+  default = ""
+  validation {
+    condition     = var.cidr_block != null || var.vpc_cidr != null
+    error_message = "Either cidr_block or vpc_cidr must be provided."
+  }
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = local.actual_cidr
+}
+
+# Step 2: Notify teams (deprecation notice in CHANGELOG, Slack, email)
+# "vpc_cidr is deprecated. Switch to cidr_block before v3.0.0"
+
+# Step 3: Monitor adoption (check who still uses old variable)
+# grep -r "vpc_cidr" across all team repos
+
+# Step 4: Remove old variable in next MAJOR version (v3.0.0)
+# Semantic versioning: breaking changes = major version bump
+# Teams pin to "?ref=v2.1.0" — won't break until they upgrade
+```
+
+**Module versioning best practice:**
+```hcl
+# Teams should ALWAYS pin module versions:
+module "vpc" {
+  source = "git::https://github.com/company/tf-modules//vpc?ref=v2.1.0"
+  # NOT: ?ref=main (breaking changes hit immediately)
+  # NOT: no ref (uses default branch = unpredictable)
+}
+
+# Or use Terraform Registry with version constraints:
+module "vpc" {
+  source  = "company/vpc/aws"
+  version = "~> 2.1"  # Allows 2.1.x but not 3.0.0
+}
+```
+
+**Tricky**: `moved` blocks (Terraform 1.1+) can help with resource renames inside modules without forcing teams to import/state-rm:
+```hcl
+# In the module code:
+moved {
+  from = aws_vpc.this
+  to   = aws_vpc.main
+}
+```
+This tells Terraform "the resource was renamed, don't destroy and recreate it." But `moved` blocks only help with RESOURCE renames, not variable renames. For variable renames, the deprecation pattern above is the only safe approach.
+
+---

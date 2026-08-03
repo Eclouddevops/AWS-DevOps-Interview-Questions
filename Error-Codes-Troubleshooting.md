@@ -438,3 +438,212 @@ echo "=== Top processes ===" && ps aux --sort=-%mem | head -5 && \
 echo "=== Network ===" && ss -s && \
 echo "=== OOM ===" && dmesg | grep -i "oom\|killed" | tail -5
 ```
+
+
+
+---
+
+## Additional Scenario-Based Tricky Questions
+
+---
+
+**Q13: Your monitoring shows HTTP 502 errors spiking every day at exactly 3:00 AM for 2-3 minutes, then resolving. Application logs show nothing. This has been happening for weeks. How do you find the root cause?**
+
+**A:**
+
+**3 AM pattern = scheduled activity:**
+```bash
+# Step 1: Check what runs at 3 AM
+crontab -l  # On all servers
+kubectl get cronjobs --all-namespaces  # K8s scheduled jobs
+aws events list-rules --query 'Rules[?ScheduleExpression!=null]'  # CloudWatch events
+
+# Step 2: Check infrastructure maintenance windows
+# AWS maintenance windows (RDS, ElastiCache, etc.)
+aws rds describe-db-instances --query 'DBInstances[].PreferredMaintenanceWindow'
+# "sun:03:00-sun:03:30" ← Maintenance window!
+
+# Step 3: Check ALB/NLB connection draining during deploys
+aws elbv2 describe-target-health --target-group-arn $TG_ARN
+# If targets show "draining" at 3 AM → scheduled deployment
+
+# Step 4: Check certificate rotation (AWS managed certs rotate periodically)
+# If cert rotates → brief TLS handshake failures → 502
+```
+
+**Common 3 AM culprits:**
+```
+1. LOG ROTATION (logrotate):
+   - logrotate sends SIGUSR1 to nginx/apache to reopen log files
+   - During reload, connections get dropped → 502 for in-flight requests
+   - Fix: Use copytruncate instead of create in logrotate config
+
+2. SSL CERTIFICATE RELOAD:
+   - Let's Encrypt certs rotate via certbot cron job
+   - Service reload during cert swap → brief 502
+   - Fix: Use --deploy-hook that gracefully reloads
+
+3. ASG SCHEDULED SCALING:
+   - Scale-down action at 3 AM (off-peak)
+   - Instances terminating → connections dropped → 502
+   - Fix: Increase deregistration delay, use connection draining
+
+4. DATABASE MAINTENANCE:
+   - RDS Multi-AZ failover during maintenance → 30s downtime
+   - App gets connection refused → returns 502 to client
+   - Fix: Implement connection retry logic in application
+
+5. BACKUP JOBS:
+   - Database dump running at 3 AM locks tables
+   - Application queries timeout → 502
+   - Fix: Use read replica for backups, not primary
+```
+
+**Debugging the ALB 502 specifically:**
+```bash
+# ALB access logs show: elb_status_code=502, target_status_code=-
+# target_status_code=- means ALB got NO response from target
+# Possible reasons:
+# - Target closed connection before responding
+# - Target didn't respond within idle timeout (60s)
+# - Target was deregistered while request was in-flight
+
+# Check CloudWatch metric: TargetConnectionErrorCount
+aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+  --metric-name TargetConnectionErrorCount --period 60 --statistics Sum \
+  --start-time "2024-01-20T02:55:00Z" --end-time "2024-01-20T03:10:00Z" \
+  --dimensions Name=LoadBalancer,Value=app/prod-alb/abc123
+```
+
+**Tricky**: 502 means "Bad Gateway" — the proxy (ALB/nginx) couldn't get a valid response from upstream. It does NOT mean the upstream server returned a 502. The upstream might have crashed, closed the connection, or never responded. Check ALB access logs: if `target_status_code` is `-` (dash), the target never responded. If it's an actual number (like 502), the application itself returned 502. These are completely different problems.
+
+---
+
+**Q14: Your application returns HTTP 429 (Too Many Requests) to 10% of users during peak hours. But you haven't implemented any rate limiting in your application code. Where are the 429s coming from?**
+
+**A:**
+
+**Hidden rate limiting sources (when you didn't implement it):**
+```
+1. AWS API GATEWAY:
+   - Default throttle: 10,000 req/s account-wide
+   - Default burst: 5,000 requests
+   - Per-method throttle if usage plans configured
+   - Returns: {"message": "Too Many Requests"} with 429
+
+2. AWS WAF RATE-BASED RULE:
+   - Rate limit: 100+ req/5min per IP (configurable)
+   - Corporate users behind NAT → single IP → throttled
+   - Returns 429 via WAF action
+
+3. CLOUD FRONT ORIGIN REQUEST LIMIT:
+   - CloudFront has per-distribution origin request limit
+   - If exceeded → CloudFront returns 429 to client
+
+4. LOAD BALANCER (NLB):
+   - NLB doesn't return 429 but can drop connections
+   - ALB returns 503 (not 429) when no targets available
+
+5. THIRD-PARTY CDN/PROXY (Cloudflare, Akamai):
+   - If sitting in front of your infrastructure
+   - Has its own rate limiting enabled by default
+   - Cloudflare "I'm Under Attack" mode → challenges users
+
+6. APPLICATION FRAMEWORK DEFAULT:
+   - Spring Boot Actuator rate limiting (default on some endpoints)
+   - Express.js rate-limit middleware (installed by dependency)
+   - Django REST framework throttling (configured in settings)
+   - Check: requirements.txt / package.json for rate-limit libraries
+```
+
+**Diagnosis:**
+```bash
+# Check response headers for rate limit info
+curl -v https://api.company.com/endpoint 2>&1 | grep -i "rate\|limit\|retry"
+# Look for:
+# X-RateLimit-Limit: 100
+# X-RateLimit-Remaining: 0
+# Retry-After: 60
+# X-Amzn-RequestId (indicates AWS service)
+
+# Check API Gateway throttle settings
+aws apigateway get-stage --rest-api-id abc123 --stage-name prod \
+  --query '{throttle:methodSettings.*.throttlingRateLimit}'
+
+# Check WAF rules
+aws wafv2 list-web-acls --scope REGIONAL \
+  --query 'WebACLs[].[Name,Id]'
+aws wafv2 get-web-acl --name prod-acl --scope REGIONAL --id xxx \
+  --query 'WebACL.Rules[?Statement.RateBasedStatement!=null]'
+```
+
+**Tricky**: The most common source of "mystery 429s" is AWS API Gateway with usage plans that someone set up months ago and forgot. Also, if your application uses shared AWS SDK clients to call DynamoDB/SQS/etc., and THOSE services return 429 (DynamoDB throttling), your application might pass the 429 directly to the end user instead of retrying. Check: are the 429s from YOUR application or from a DOWNSTREAM service being proxied?
+
+---
+
+**Q15: Users report your site loads slowly but eventually works. Investigation shows responses take 10+ seconds. HTTP status is 200 (not timeout). No errors in logs. Application CPU/memory are normal. Network latency to origin is 5ms. Where is the 10 seconds going?**
+
+**A:**
+
+**The "slow 200" mystery — common causes:**
+```
+1. DNS RESOLUTION (5s timeout + retry):
+   - App resolves external service DNS
+   - DNS query to VPC resolver times out (rate limit)
+   - Retries after 5s → succeeds on second try
+   - Total: 5s wasted on DNS
+   - Check: dig +trace api.external.com from the instance
+
+2. CONNECTION POOL EXHAUSTION:
+   - All HTTP connections to downstream service in use
+   - New requests WAIT in queue for a connection
+   - Wait time = 10s (until someone finishes)
+   - No error because it eventually gets a connection
+   - Check: connection pool metrics (active/waiting/idle)
+
+3. LOCK CONTENTION (database):
+   - Query needs row lock held by another transaction
+   - Waits for lock release → 10 seconds (lock timeout)
+   - Eventually gets lock → executes → returns 200
+   - Check: SELECT * FROM pg_stat_activity WHERE wait_event_type='Lock'
+
+4. GARBAGE COLLECTION PAUSE (Java):
+   - Full GC pause: 5-15 seconds
+   - All request threads frozen
+   - After GC completes → all queued requests complete simultaneously
+   - Check: GC logs: -XX:+PrintGCDetails -XX:+PrintGCTimeStamps
+
+5. THREAD POOL FULL (Tomcat/Netty):
+   - Max threads: 200 (default)
+   - 200 requests being processed (some slow downstream call)
+   - Request 201 waits in queue → 10s queue time + 100ms processing
+   - Total: 10.1s → returns 200
+   - Check: /actuator/metrics/tomcat.threads.busy
+
+6. TCP RETRANSMISSION:
+   - Packet lost between service A and B
+   - TCP retransmits after exponential backoff: 200ms, 400ms, 800ms, 1.6s, 3.2s...
+   - Total delay before success: ~6 seconds
+   - Check: netstat -s | grep retransmit
+```
+
+**Diagnosis approach:**
+```bash
+# Add timing to each phase of request processing
+curl -w "@curl-format.txt" -o /dev/null -s https://api.company.com/slow-endpoint
+
+# curl-format.txt:
+#   time_namelookup: %{time_namelookup}s    ← DNS
+#   time_connect:    %{time_connect}s       ← TCP connect
+#   time_appconnect: %{time_appconnect}s    ← TLS handshake
+#   time_starttransfer: %{time_starttransfer}s  ← Time to first byte (TTFB)
+#   time_total:      %{time_total}s
+
+# If time_starttransfer >> time_appconnect → server processing slow
+# If time_namelookup > 1s → DNS problem
+# If time_connect >> time_namelookup → TCP connection problem
+```
+
+**Tricky**: "Slow 200s" are harder to debug than errors because nothing is obviously broken. The key is distributed tracing (Jaeger/X-Ray) which shows WHERE in the request lifecycle time is spent. Without tracing, use structured logging with timestamps at each step: "DNS resolved at T+0ms, Connection established at T+5ms, Request sent at T+6ms, Response received at T+10050ms" → 10s between request sent and response = downstream slow.
+
+---
