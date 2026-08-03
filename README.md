@@ -1,6 +1,6 @@
 # AWS DevOps Interview Questions — Deep-Dive Collection
 
-A comprehensive collection of **300+ deep-dive interview questions with detailed answers** covering all major AWS and DevOps topics. Designed for L3/L4 level interviews with tricky, scenario-based questions.
+A comprehensive collection of **400+ deep-dive interview questions with detailed answers** covering all major AWS and DevOps topics. Designed for L3/L4 level interviews with tricky, scenario-based questions that mirror real production work in industry.
 
 ## Topics Covered
 
@@ -24,16 +24,24 @@ A comprehensive collection of **300+ deep-dive interview questions with detailed
 | 16 | AWS CloudWatch Metrics Deep Dive | [AWS-CloudWatch-Metrics-DeepDive.md](./AWS-CloudWatch-Metrics-DeepDive.md) | 25 |
 | 17 | SSL Certificates, CA & AWS Certificate Manager | [SSL-CA-AWS-CertificateManager.md](./SSL-CA-AWS-CertificateManager.md) | 50 |
 | 18 | AWS RDS Deep Dive (Aurora, Multi-AZ, Replicas) | [AWS-RDS-DeepDive.md](./AWS-RDS-DeepDive.md) | 40 |
+| 19 | Production Incident & Live Troubleshooting | [Production-Incident-Troubleshooting-TrickyQuestions.md](./Production-Incident-Troubleshooting-TrickyQuestions.md) | 16 |
+| 20 | AWS Networking & VPC (Transit Gateway, PrivateLink) | [AWS-Networking-VPC-TrickyQuestions.md](./AWS-Networking-VPC-TrickyQuestions.md) | 12 |
+| 21 | CI/CD & GitOps Production Scenarios | [CI-CD-GitOps-Production-TrickyQuestions.md](./CI-CD-GitOps-Production-TrickyQuestions.md) | 11 |
+| 22 | Kubernetes Production Tricky Scenarios | [Kubernetes-Production-TrickyScenarios.md](./Kubernetes-Production-TrickyScenarios.md) | 8 |
+| 23 | AWS Cost Optimization in Production | [AWS-Cost-Optimization-Production-TrickyQuestions.md](./AWS-Cost-Optimization-Production-TrickyQuestions.md) | 6 |
 
 ## Key Features
 
 - Deep-dive questions with detailed explanations
 - Tricky scenario-based questions for senior interviews
+- **NEW: Live production incident scenarios** (on-call, real debugging, war stories)
+- **NEW: Industry-based questions** reflecting actual daily work of senior DevOps engineers
 - Code examples (Python, Bash, YAML, JSON, HCL)
 - Architecture diagrams (ASCII)
 - Comparison tables for quick reference
 - Real-world troubleshooting scenarios
 - Best practices and anti-patterns
+- Cost optimization strategies used in production
 
 ## How to Use
 
