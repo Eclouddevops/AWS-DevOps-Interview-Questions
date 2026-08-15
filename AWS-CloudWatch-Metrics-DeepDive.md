@@ -1232,3 +1232,1312 @@ sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
 ```
 
 **Tricky**: `cpu_usage_steal` is critical for T-instances. High steal % means the hypervisor is taking CPU away from your instance (burst credits exhausted, noisy neighbor on bare metal). This is INVISIBLE without the agent!
+
+
+---
+
+## 12. Advanced Scenario-Based & Tricky Questions
+
+**Q26: SCENARIO — Your Auto Scaling Group keeps launching and terminating instances every 5 minutes. CloudWatch shows CPUUtilization oscillating between 20% and 75%. What's happening and how do you fix it?**
+
+**A:**
+
+**This is called "thrashing" or "flapping" — a classic scaling oscillation problem.**
+
+```
+Timeline:
+00:00 - CPU at 75% → Scale-out alarm fires → Launch 2 instances
+00:03 - New instances start receiving traffic
+00:05 - CPU drops to 20% (more instances = less load per instance)
+00:07 - Scale-in alarm fires (CPU < 30%) → Terminate 2 instances
+00:09 - CPU rises back to 75% (fewer instances = more load per instance)
+00:10 - Scale-out fires again → REPEAT FOREVER
+```
+
+**Root causes:**
+
+1. **Cooldown period too short:**
+```
+Default cooldown: 300 seconds
+Your cooldown: 60 seconds → too short to stabilize
+Fix: Increase cooldown to 300-600 seconds
+```
+
+2. **Scale-out and scale-in thresholds too close:**
+```
+Scale-out: CPU > 70%
+Scale-in:  CPU < 30%
+Gap is only 40% → natural oscillation crosses both
+
+Fix: Widen the gap
+Scale-out: CPU > 70%  (alarm: 2/3 periods breaching)
+Scale-in:  CPU < 40%  (alarm: 10/10 periods breaching)
+Make scale-in MUCH harder to trigger than scale-out
+```
+
+3. **Target Tracking policy with wrong target:**
+```
+Target: CPUUtilization = 50%
+Instance startup time: 3 minutes
+ASG overcompensates → launches too many → CPU drops → terminates
+
+Fix: Use Target Tracking with longer warmup:
+{
+  "TargetValue": 60.0,
+  "EstimatedInstanceWarmup": 300  ← Key! Wait for instances to warm
+}
+```
+
+4. **Step scaling without proper step design:**
+```
+Bad: Add 5 instances when CPU > 70%, Remove 5 when CPU < 30%
+Good: Add 2 when 70-80%, Add 4 when 80-90%, Add 8 when > 90%
+      Remove 1 when 40-30%, Remove 2 when < 30%
+Scale IN slowly, scale OUT aggressively
+```
+
+**Best practice configuration:**
+```json
+{
+  "ScaleOutPolicy": {
+    "Threshold": 70,
+    "EvaluationPeriods": 2,
+    "Period": 60,
+    "Cooldown": 120
+  },
+  "ScaleInPolicy": {
+    "Threshold": 35,
+    "EvaluationPeriods": 15,
+    "Period": 60,
+    "Cooldown": 600
+  }
+}
+```
+
+**Tricky**: The `EstimatedInstanceWarmup` in Target Tracking is CRITICAL. Without it, ASG sees new instances reporting 0% CPU (still booting) → average CPU drops → ASG thinks it over-scaled → terminates instances before they even start serving traffic!
+
+---
+
+
+**Q27: SCENARIO — RDS `ReadLatency` suddenly spiked from 2ms to 200ms. `CPUUtilization` is only 40%, `FreeableMemory` is stable at 4GB. What's wrong?**
+
+**A:**
+
+**Key insight: CPU and memory are fine, but reads are 100x slower. This points to STORAGE.**
+
+**Investigation order:**
+
+1. **Check `DiskQueueDepth`:**
+```
+DiskQueueDepth > 10 → Storage is overloaded
+I/O requests are queuing up → each read waits longer
+```
+
+2. **Check `BurstBalance` (gp2 only):**
+```
+BurstBalance = 0% → Your EBS volume has NO burst credits left!
+Volume is throttled to baseline IOPS
+100GB gp2 baseline = 300 IOPS → Trying to do 3000 → queuing → 200ms latency
+
+FIX: Increase volume to 1TB+ gp2 (baseline = 3000 IOPS)
+     OR migrate to gp3 (3000 IOPS baseline always)
+     OR migrate to io2 (provision exact IOPS needed)
+```
+
+3. **Check `ReadIOPS` vs provisioned IOPS:**
+```
+If ReadIOPS hitting ceiling → storage maxed out
+For io1/io2: Check if actual IOPS = provisioned IOPS (hitting limit)
+```
+
+4. **Check for vacuum/analyze running (PostgreSQL):**
+```
+PostgreSQL auto-vacuum can cause I/O storms
+Check: pg_stat_progress_vacuum
+Symptom: Random I/O spike during low-traffic hours
+Fix: Tune vacuum settings, schedule during maintenance window
+```
+
+5. **Check for backup/snapshot in progress:**
+```
+RDS automated backups cause additional I/O
+Check: RDS Events → "Backing up DB instance"
+Snapshot reads entire volume → competes with production I/O
+Symptom: Daily spike at backup time
+Fix: Adjust backup window to lowest traffic period
+```
+
+6. **Check for buffer pool miss storm:**
+```
+If a large table scan happened (SELECT without index):
+├── Reads bypass buffer pool → goes to disk
+├── Flushes useful pages from buffer pool
+├── Subsequent normal queries also miss cache → disk reads
+└── "Cascading cache miss"
+Fix: Add missing indexes, check slow query log
+```
+
+**Complete diagnosis command:**
+```bash
+# Get multiple metrics at once
+aws cloudwatch get-metric-data --metric-data-queries '[
+  {"Id":"latency","MetricStat":{"Metric":{"Namespace":"AWS/RDS","MetricName":"ReadLatency","Dimensions":[{"Name":"DBInstanceIdentifier","Value":"prod-db"}]},"Period":60,"Stat":"Average"}},
+  {"Id":"iops","MetricStat":{"Metric":{"Namespace":"AWS/RDS","MetricName":"ReadIOPS","Dimensions":[{"Name":"DBInstanceIdentifier","Value":"prod-db"}]},"Period":60,"Stat":"Average"}},
+  {"Id":"queue","MetricStat":{"Metric":{"Namespace":"AWS/RDS","MetricName":"DiskQueueDepth","Dimensions":[{"Name":"DBInstanceIdentifier","Value":"prod-db"}]},"Period":60,"Stat":"Average"}},
+  {"Id":"burst","MetricStat":{"Metric":{"Namespace":"AWS/RDS","MetricName":"BurstBalance","Dimensions":[{"Name":"DBInstanceIdentifier","Value":"prod-db"}]},"Period":60,"Stat":"Average"}}
+]' --start-time 2024-01-01T00:00:00 --end-time 2024-01-01T01:00:00
+```
+
+**Tricky**: `ReadLatency` in RDS is per-OPERATION average. Even a few extremely slow reads (full table scan) average UP the metric significantly. Check `ReadIOPS` too — if IOPS is normal but latency is high, individual I/O operations are slow (storage layer problem, not volume of reads).
+
+---
+
+
+**Q28: SCENARIO — Lambda function shows 0 `Errors` but users report receiving wrong data. How do you detect "silent failures" with CloudWatch?**
+
+**A:**
+
+**The most dangerous type of bug — function succeeds (no error) but returns incorrect data.**
+
+**Why standard metrics miss this:**
+```
+Lambda Metrics:
+├── Invocations: 10,000 ✓
+├── Errors: 0 ✓ (no exceptions thrown)
+├── Duration: 200ms ✓ (normal speed)
+├── Throttles: 0 ✓
+└── Everything looks PERFECT... but data is wrong!
+```
+
+**Detection strategies:**
+
+1. **Custom business metrics (Embedded Metric Format):**
+```python
+import json
+
+def handler(event, context):
+    result = process_order(event)
+    
+    # Emit business metric alongside response
+    print(json.dumps({
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": "MyApp/Orders",
+                "Dimensions": [["Status"]],
+                "Metrics": [{"Name": "OrderResult", "Unit": "Count"}]
+            }]
+        },
+        "Status": result.status,  # "success", "empty_response", "stale_data"
+        "OrderResult": 1
+    }))
+    
+    # Validate response before returning
+    if not result.items or len(result.items) == 0:
+        # Emit "empty response" metric
+        print(json.dumps({...EmptyResponseMetric...}))
+    
+    return {"statusCode": 200, "body": json.dumps(result)}
+```
+
+2. **Response validation with custom metric:**
+```python
+# After processing, validate the response makes sense
+def validate_response(response, request):
+    if response.user_id != request.user_id:
+        cloudwatch.put_metric_data(
+            Namespace='MyApp/Integrity',
+            MetricData=[{'MetricName': 'DataMismatch', 'Value': 1}]
+        )
+    if response.timestamp < (time.time() - 3600):
+        cloudwatch.put_metric_data(
+            Namespace='MyApp/Integrity',
+            MetricData=[{'MetricName': 'StaleData', 'Value': 1}]
+        )
+```
+
+3. **Canary/Synthetic monitoring:**
+```
+CloudWatch Synthetics Canary:
+├── Runs every 5 minutes
+├── Calls API with KNOWN input
+├── Validates response matches EXPECTED output
+├── Emits SuccessPercent metric
+└── Alarm when SuccessPercent < 100%
+```
+
+4. **Cross-service comparison metrics:**
+```
+Compare: Orders Created (API) vs Orders in Database vs Orders in SQS
+If API says 100 orders created but DB only has 95 → 5 lost!
+Metric: "OrderDiscrepancy" = API_count - DB_count
+Alarm: OrderDiscrepancy > 0
+```
+
+5. **Log-based anomaly detection:**
+```
+CloudWatch Logs Insights:
+fields @timestamp, response_body
+| filter response_body like /null/ or response_body like /\[\]/
+| stats count() as empty_responses by bin(5m)
+→ Create metric filter: count of empty/null responses
+→ Alarm when empty_responses > baseline × 2
+```
+
+**Tricky**: The deadliest production bugs have NO error signals. You MUST instrument business-level metrics: "orders processed correctly", "cache responses validated", "data freshness confirmed". Infrastructure metrics alone cannot detect logic bugs.
+
+---
+
+
+**Q29: SCENARIO — ElastiCache `EngineCPUUtilization` is at 95% but `CPUUtilization` shows only 25%. The team says "CPU is fine, only 25%." Why are they wrong?**
+
+**A:**
+
+**This is one of the most common ElastiCache misunderstandings!**
+
+```
+Redis Architecture:
+├── SINGLE-THREADED command processing (1 core handles ALL commands)
+├── Background threads: Lazy freeing, I/O threads (Redis 6+), RDB save
+└── Multiple CPU cores available but main thread uses ONLY ONE
+
+Metrics explained:
+├── CPUUtilization = Average across ALL CPU cores
+│   Example: 4-core node, 1 core at 100%, 3 at 0% → shows 25%
+│   
+└── EngineCPUUtilization = Redis main thread ONLY
+    Example: Main thread at 100% → shows 100% (actual bottleneck!)
+```
+
+**Visual:**
+```
+4-Core Redis Node:
+Core 0: ████████████ 100% ← Redis engine (all commands)
+Core 1: ░░░░░░░░░░░░   0% ← Idle
+Core 2: ██░░░░░░░░░░  15% ← Background (RDB save, lazy free)
+Core 3: █░░░░░░░░░░░  10% ← I/O threads
+
+CPUUtilization = (100+0+15+10)/4 = 31.25%  ← "Looks fine!"
+EngineCPUUtilization = 100%  ← REDIS IS MAXED OUT!
+```
+
+**Impact when EngineCPUUtilization = 95%+:**
+- Command latency increases exponentially
+- Timeouts for client operations
+- Pub/Sub messages delayed
+- Cluster operations slow (if cluster mode)
+- Looks like network issue to application (but it's CPU!)
+
+**Solutions:**
+
+1. **Read replicas** (for read-heavy workloads):
+```
+Primary: Handles writes + some reads
+Replicas: Handle read traffic (offload primary CPU)
+Configure app: Read from replicas, write to primary
+```
+
+2. **Scale OUT with cluster mode (sharding):**
+```
+Shard 1: Keys A-M → own CPU
+Shard 2: Keys N-Z → own CPU
+Each shard handles less traffic → lower CPU per node
+```
+
+3. **Optimize expensive commands:**
+```
+# Find slow commands
+redis-cli slowlog get 10
+
+# Common CPU killers:
+KEYS * → O(N) scans entire keyspace! Use SCAN instead
+SORT with large lists → CPU intensive
+Lua scripts with loops → blocks everything
+Large HGETALL on huge hashes → serialize + send
+
+# Fix: Replace KEYS with SCAN, paginate large operations
+```
+
+4. **Larger node type** (more powerful single core):
+```
+cache.r6g.large → cache.r6g.xlarge (faster CPU clock)
+More GHz per core = more commands per second
+```
+
+**Alarm:**
+```
+ALWAYS alarm on EngineCPUUtilization, NOT CPUUtilization for Redis!
+Threshold: EngineCPUUtilization > 65% → Warning
+           EngineCPUUtilization > 80% → Critical
+```
+
+**Tricky**: Redis 7.0+ has multi-threaded I/O (io-threads config) which can help with network-bound workloads. But the COMMAND PROCESSING is still single-threaded. Multi-threaded I/O helps with serialization/deserialization, not with actual command execution.
+
+---
+
+
+**Q30: SCENARIO — Your CloudWatch alarm triggered (CPU > 80% for 3 periods) but when you checked, CPU was at 20%. Was it a false alarm? How do you investigate?**
+
+**A:**
+
+**This is NOT necessarily a false alarm. Common reasons:**
+
+1. **Alarm already resolved by the time you looked:**
+```
+Timeline:
+T+0min: CPU spikes to 85% (alarm evaluating...)
+T+5min: CPU still 85% (2nd period breaching)
+T+10min: CPU hits 90% (3rd period → ALARM triggers → SNS notification)
+T+12min: Auto-scaling adds instances → CPU drops to 40%
+T+15min: You check CloudWatch dashboard → shows 20% (already resolved!)
+
+Investigation: Look at the GRAPH, not just current value
+Fix: Always include time range in alarm notification
+```
+
+2. **Statistics mismatch — you're looking at the wrong statistic:**
+```
+Alarm configured on: Maximum CPUUtilization > 80%
+Dashboard showing: Average CPUUtilization = 20%
+
+Both are correct! Maximum of 85% triggered alarm,
+but Average over the period is only 20% (spike was brief)
+
+Fix: Align dashboard widgets with alarm statistics
+```
+
+3. **Dimension mismatch — alarm on one instance, dashboard on all:**
+```
+Alarm: CPUUtilization for instance i-abc123 > 80% → FIRED
+Dashboard: CPUUtilization AVERAGE across ALL instances = 20%
+
+One instance was at 85%, others at 15% → average is low
+Fix: Dashboard should show per-instance breakdown
+```
+
+4. **Metric math alarm vs raw metric:**
+```
+Alarm on: (CPUUtilization + IOWaitPercent) > 80%
+You check: CPUUtilization alone = 20%
+But: IOWaitPercent was 65% → Combined = 85% → alarm valid!
+```
+
+**How to investigate retroactively:**
+```bash
+# Check alarm state history
+aws cloudwatch describe-alarm-history \
+  --alarm-name "HighCPU-prod" \
+  --history-item-type StateUpdate \
+  --max-records 10
+
+# Get the actual data points that triggered the alarm
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/EC2 \
+  --metric-name CPUUtilization \
+  --dimensions Name=InstanceId,Value=i-abc123 \
+  --start-time "2024-01-01T10:00:00Z" \
+  --end-time "2024-01-01T11:00:00Z" \
+  --period 60 \
+  --statistics Maximum Average
+
+# Check if auto-scaling acted
+aws autoscaling describe-scaling-activities \
+  --auto-scaling-group-name prod-asg \
+  --max-records 5
+```
+
+**Best practices for alarm investigation:**
+```
+1. ALWAYS include metric graph snapshot in alarm notification
+2. Use CloudWatch Alarm annotation (shows when alarm fired on graph)
+3. Set up dashboard with auto-refresh during incidents
+4. Use Composite Alarms to reduce false positives
+5. Log alarm state changes to CloudWatch Logs for audit trail
+```
+
+**Tricky**: CloudWatch evaluates alarms using data points AT THE TIME of evaluation. If a metric is reported with a delay (some custom metrics), the alarm may fire "late" — when you check, the real issue was 5-10 minutes ago. Always look at the historical graph, not the current value.
+
+---
+
+
+**Q31: SCENARIO — DynamoDB shows `ReadThrottleEvents` > 0 but `ConsumedReadCapacityUnits` is well below `ProvisionedReadCapacityUnits`. How is throttling happening below capacity?**
+
+**A:**
+
+**This is the famous "hot partition" problem — one of the trickiest DynamoDB interview questions!**
+
+```
+Table configuration:
+├── Provisioned: 10,000 RCU
+├── Consumed (average): 3,000 RCU (only 30% utilized!)
+├── Partitions: 10 (AWS manages internally)
+├── Per-partition capacity: ~1,000 RCU each
+└── BUT: One partition receiving 3,000 RCU → THROTTLED!
+
+Visual:
+Partition 1: ████████████████████ 3,000 RCU (THROTTLED at 1,000!)
+Partition 2: ██                   200 RCU
+Partition 3: ███                  300 RCU
+Partition 4: █                    100 RCU
+Partition 5-10: █                 100 RCU each
+Total: 3,000 RCU consumed / 10,000 provisioned = 30% utilization
+BUT: Partition 1 is throttled!
+```
+
+**Why this happens:**
+1. **Poor partition key design:**
+```
+Bad keys: "status" (only 3 values: pending/active/completed)
+         "date" (today's date → all traffic hits ONE partition)
+         "country" (90% of users in one country)
+
+Good keys: user_id, order_id, UUID (high cardinality, uniform distribution)
+```
+
+2. **Popular item ("celebrity problem"):**
+```
+One item accessed 10,000 times/second (viral product, trending user)
+That item's partition key → single partition → throttled
+Fix: Write-sharding (user#1, user#2, user#3) + scatter-gather reads
+     OR use DAX cache in front (absorbs hot key reads)
+```
+
+3. **Adaptive capacity (helps but doesn't eliminate):**
+```
+DynamoDB adaptive capacity:
+├── Automatically reallocates unused capacity to hot partitions
+├── Can BOOST a partition up to total table provisioned capacity
+├── Takes 5-30 minutes to detect and adapt
+└── Doesn't help for instant spikes (first few minutes still throttle)
+```
+
+**Detection:**
+```bash
+# Enable Contributor Insights for DynamoDB
+aws dynamodb update-contributor-insights \
+  --table-name MyTable \
+  --contributor-insights-action ENABLE
+
+# This shows TOP partition keys by consumption
+# Identify which keys are "hot"
+
+# CloudWatch metric with partition-level detail:
+# Use Contributor Insights → shows most accessed keys
+```
+
+**Solutions by severity:**
+
+| Approach | Effort | Effectiveness |
+|----------|--------|---------------|
+| Switch to On-Demand mode | Low | Good (auto-adapts, still has per-partition limits) |
+| Add DAX cache for hot reads | Medium | Excellent (absorbs hot key traffic) |
+| Write-sharding (add random suffix to PK) | Medium | Excellent (distributes load) |
+| Redesign partition key | High | Best (fundamental fix) |
+| GSI with different partition key | Medium | Good (alternative access pattern) |
+
+**Tricky**: Even On-Demand mode has per-partition limits (~3,000 RCU / 1,000 WCU per partition). On-Demand just removes the TABLE-level limit. If your partition key is bad, you STILL get throttled on On-Demand!
+
+---
+
+
+**Q32: SCENARIO — Your application's P99 latency doubled overnight but P50 is unchanged. What does this mean and how do you investigate?**
+
+**A:**
+
+**P50 unchanged + P99 doubled = A SUBSET of requests is very slow while most are fine.**
+
+```
+Before:
+├── P50 (median): 50ms (half of requests < 50ms)
+├── P95: 100ms
+└── P99: 200ms (1% of requests > 200ms)
+
+After:
+├── P50: 50ms (unchanged — most requests still fast!)
+├── P95: 150ms (slightly worse)
+└── P99: 400ms (1% of requests now taking 400ms+)
+```
+
+**What causes P99 to spike without affecting P50:**
+
+1. **Cold starts (Lambda/containers):**
+```
+99% of requests hit warm instances → 50ms (P50 unchanged)
+1% hit cold starts → 400ms+ (P99 doubles)
+Cause: Scaling event, deployment, or provisioned concurrency exhausted
+Check: Lambda InitDuration metric, ProvisionedConcurrencySpilloverInvocations
+```
+
+2. **Database connection pool exhaustion:**
+```
+Normal: Get connection from pool → 0ms overhead
+When pool full: Wait for connection → 200ms+ wait time
+Only affects requests that arrive when pool is empty (tail latency)
+Check: DatabaseConnections metric, app connection pool wait metrics
+```
+
+3. **Garbage collection pauses (JVM):**
+```
+Most requests: No GC → fast
+Occasional: Full GC pause → 200ms+ stop-the-world
+Affects random 1-2% of requests
+Check: JVM GC metrics, cpu_usage_system spikes, Lambda duration outliers
+```
+
+4. **Network retries (microservices):**
+```
+First attempt: Succeeds in 50ms (99% of requests)
+Retry needed: Timeout (200ms) + retry (50ms) = 250ms extra
+Only requests hitting a momentarily unhealthy backend retry
+Check: Retry metrics, downstream service health
+```
+
+5. **Cache miss vs cache hit:**
+```
+Cache hit: 5ms (direct from Redis)
+Cache miss: 200ms (database query + cache write)
+If 1% of requests are cache misses (new/expired keys) → P99 spikes
+Check: ElastiCache CacheHitRate, per-endpoint latency breakdown
+```
+
+6. **DNS resolution timeout:**
+```
+Normally: DNS cached → 0ms
+Occasionally: Cache expired → DNS lookup → 50-100ms
+If DNS server slow → timeout + retry → 200ms+
+Check: Custom metric on DNS resolution time, or VPC DNS throttling
+```
+
+**Investigation approach:**
+```bash
+# CloudWatch Logs Insights - find slow requests
+fields @timestamp, @message, latency
+| filter latency > 400
+| sort latency desc
+| limit 50
+
+# Look for patterns:
+# - Same user/IP? (specific client issue)
+# - Same endpoint? (specific code path slow)
+# - Same time pattern? (correlates with cron job, GC, backup?)
+# - Same target? (specific instance unhealthy)
+```
+
+**Tricky**: Most dashboards show AVERAGE latency which hides P99 problems completely! Average of 1000 requests at 50ms + 10 requests at 5000ms = 99ms average — looks fine! But those 10 users waited 5 SECONDS. ALWAYS monitor P99, not just average.
+
+---
+
+
+**Q33: SCENARIO — CloudWatch shows `StatusCheckFailed_System = 1` on an EC2 instance. What exactly happened and what are your options?**
+
+**A:**
+
+**`StatusCheckFailed_System = 1` means AWS HARDWARE has a problem — NOT your software.**
+
+```
+Two types of status checks:
+├── StatusCheckFailed_Instance (software/OS level)
+│   ├── OS crashed/hung
+│   ├── Networking misconfigured
+│   ├── Disk full / corrupt filesystem
+│   ├── Incompatible kernel
+│   └── YOUR responsibility to fix
+│
+└── StatusCheckFailed_System (hardware level) ← THIS ONE
+    ├── Loss of network connectivity (host-level)
+    ├── Loss of system power (physical host)
+    ├── Hardware issues on physical host
+    ├── Software issues on host hypervisor
+    └── AWS responsibility — you can't fix the hardware!
+```
+
+**What to do:**
+
+1. **Immediate — Stop and Start (not reboot!):**
+```bash
+# STOP then START moves instance to different physical hardware
+aws ec2 stop-instances --instance-ids i-abc123
+aws ec2 start-instances --instance-ids i-abc123
+
+# WARNING: Public IP changes (unless Elastic IP)!
+# WARNING: Instance store data is LOST!
+# WARNING: Does NOT work for instance-store-backed instances!
+
+# REBOOT does NOT help — stays on same hardware!
+```
+
+2. **Automated recovery (recommended):**
+```bash
+# CloudWatch Alarm with EC2 Recovery Action
+aws cloudwatch put-metric-alarm \
+  --alarm-name "AutoRecover-i-abc123" \
+  --namespace AWS/EC2 \
+  --metric-name StatusCheckFailed_System \
+  --dimensions Name=InstanceId,Value=i-abc123 \
+  --statistic Maximum \
+  --period 60 \
+  --evaluation-periods 2 \
+  --threshold 1 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --alarm-actions arn:aws:automate:us-east-1:ec2:recover
+```
+
+3. **Auto Scaling Group (best for production):**
+```
+ASG detects unhealthy instance → Terminates → Launches new one
+├── Works for both instance and system failures
+├── New instance on healthy hardware
+└── Combined with ELB health checks for full coverage
+```
+
+**Recovery action limitations:**
+- Only works for instances with EBS root volume (not instance store)
+- Instance retains: private IP, Elastic IP, EBS volumes, metadata
+- Instance loses: instance store data, public IP (if no EIP)
+- Does NOT work across AZs (recovers in same AZ)
+
+**Tricky**: If an entire AZ has issues (rare but happens), system status checks fail for MANY instances simultaneously. Recovery alarm tries to recover in the SAME AZ (may fail again). Solution: Multi-AZ architecture with ASG spanning multiple AZs.
+
+---
+
+
+**Q34: SCENARIO — ECS Service shows `CPUUtilization` at 10% but `MemoryUtilization` at 95%. Auto-scaling on CPU isn't triggering. What's the fix?**
+
+**A:**
+
+**Classic mistake: Scaling on the WRONG metric for a memory-bound application.**
+
+```
+Your ECS Service:
+├── Task Definition: 1024 CPU units, 2048 MB memory
+├── Running Tasks: 4
+├── CPUUtilization: 10% (barely using CPU)
+├── MemoryUtilization: 95% (about to OOMKill!)
+├── Auto-scaling: Target Tracking on CPUUtilization = 60%
+└── Result: ASG thinks everything is fine! Won't scale out.
+
+Meanwhile: Tasks are hitting memory limits → OOMKilled → restarted → bad UX
+```
+
+**Why this happens:**
+- Java/Node.js applications that are memory-heavy but CPU-light
+- Applications with large in-memory caches
+- Applications processing large payloads/files
+- Services with many idle connections (each holds memory)
+
+**Solutions:**
+
+1. **Scale on MemoryUtilization instead:**
+```json
+{
+  "TargetTrackingScalingPolicyConfiguration": {
+    "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ECSServiceAverageMemoryUtilization"
+    },
+    "TargetValue": 70.0,
+    "ScaleOutCooldown": 60,
+    "ScaleInCooldown": 300
+  }
+}
+```
+
+2. **Scale on BOTH metrics (most robust):**
+```
+Policy 1: Target CPU at 60% → scales if CPU-bound
+Policy 2: Target Memory at 70% → scales if memory-bound
+ECS picks whichever results in MORE capacity (most aggressive wins)
+```
+
+3. **Scale on custom application metric:**
+```
+Custom metric: "RequestQueueDepth" or "ActiveConnections"
+More accurate than infrastructure metrics for application load
+```
+
+4. **Fix the memory issue:**
+```
+├── Memory leak? → Profile and fix application
+├── JVM heap too large? → Reduce -Xmx, enable GC tuning
+├── Task memory too small? → Increase task memory definition
+└── Need larger node? → Use bigger Fargate task size
+```
+
+**Critical ECS memory concepts:**
+```
+Task Definition Memory = Hard limit (OOMKill if exceeded)
+Task Definition MemoryReservation = Soft limit (for scheduling/metrics)
+MemoryUtilization metric = Used / Hard Limit × 100%
+
+Example:
+├── Hard limit: 2048 MB
+├── Soft reservation: 1024 MB
+├── Actual usage: 1900 MB
+├── MemoryUtilization: 1900/2048 = 92.8%
+└── If it hits 2048 → Container killed with exit code 137 (OOMKilled)
+```
+
+**Tricky**: ECS `MemoryUtilization` is relative to the HARD limit in task definition. If you set memory=4096 but your app only needs 2048 at peak, utilization shows 50% even when the app is actually at its maximum. Rightsize the task definition to match actual peak usage for meaningful metrics.
+
+---
+
+
+**Q35: SCENARIO — You set up a CloudWatch alarm for `NetworkIn` > 1GB/period but it never fires even during traffic spikes. What's wrong?**
+
+**A:**
+
+**Most likely: UNIT MISMATCH. One of the most common CloudWatch mistakes!**
+
+```
+The problem:
+├── NetworkIn metric reports in BYTES
+├── You set threshold to 1,000,000,000 (1GB in bytes) ✓
+├── BUT you're using wrong STATISTIC!
+
+Scenario 1: Using "Average" statistic
+├── Period: 300 seconds (5 min)
+├── NetworkIn Average = Total bytes / Number of data points
+├── If 10 data points reported: Average = TotalBytes / 10
+├── This is NOT total traffic! It's average per report cycle!
+└── FIX: Use "Sum" statistic for cumulative metrics!
+
+Scenario 2: Using wrong period
+├── You want: alert if > 1GB in 5 minutes
+├── But period = 3600 (1 hour)
+├── Over 1 hour, 1GB is easy to reach normally
+└── FIX: Match period to your alert intent
+```
+
+**Correct alarm for "alert if network traffic > 1GB in 5 minutes":**
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name "HighNetworkTraffic" \
+  --namespace AWS/EC2 \
+  --metric-name NetworkIn \
+  --dimensions Name=InstanceId,Value=i-abc123 \
+  --statistic Sum \         # SUM not Average!
+  --period 300 \            # 5 minutes
+  --evaluation-periods 1 \
+  --threshold 1073741824 \  # 1GB in bytes
+  --comparison-operator GreaterThanThreshold
+```
+
+**When to use which statistic:**
+
+| Metric Type | Use Statistic | Why |
+|-------------|--------------|-----|
+| NetworkIn/Out (bytes) | Sum | Total traffic in period |
+| CPUUtilization (%) | Average | Mean utilization |
+| Latency | Average, p99 | Mean or tail latency |
+| Error count | Sum | Total errors in period |
+| Queue depth | Average or Maximum | Current depth or worst-case |
+| StatusCheckFailed | Maximum | Any failure in period = 1 |
+| Connections | Average | Typical concurrency |
+
+**Other common unit mistakes:**
+```
+FreeableMemory: Reported in BYTES → alarm threshold must be in bytes
+                500 MB = 524,288,000 bytes (not 500!)
+                
+Duration (Lambda): Reported in MILLISECONDS
+                   5 seconds = 5000 (not 5!)
+
+ReadLatency (RDS): Reported in SECONDS (with decimals)
+                   5ms = 0.005 (not 5!)
+```
+
+**Tricky**: Some metrics like `CPUCreditBalance` are unitless (count of credits). `FreeableMemory` is in bytes. `ReadLatency` is in seconds. Always check the UNIT in metric documentation before setting thresholds. A threshold of "500" means very different things depending on the unit!
+
+---
+
+
+**Q36: SCENARIO — After a deployment, Lambda `Duration` increased from 200ms to 800ms. No errors, no throttles. How do you find the root cause using CloudWatch?**
+
+**A:**
+
+**Systematic investigation using CloudWatch + X-Ray:**
+
+**Step 1: Isolate WHEN it started:**
+```bash
+# Get Duration metric with 1-minute resolution around deployment time
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/Lambda \
+  --metric-name Duration \
+  --dimensions Name=FunctionName,Value=my-function \
+  --start-time "2024-01-01T14:00:00Z" \
+  --end-time "2024-01-01T16:00:00Z" \
+  --period 60 \
+  --statistics Average p99 Maximum
+  
+# Confirm: Duration jumped exactly at deployment time
+```
+
+**Step 2: Check if it's cold starts vs all invocations:**
+```bash
+# Check InitDuration (only reported for cold starts)
+# If InitDuration also increased → dependency loading slower
+# If InitDuration unchanged but Duration increased → runtime issue
+
+# Also check: ProvisionedConcurrencySpilloverInvocations
+# If > 0 after deployment → cold starts happening (maybe new version not warmed)
+```
+
+**Step 3: Check ConcurrentExecutions:**
+```
+If concurrent executions increased → function is running longer → backing up
+Self-reinforcing: Slow function → holds concurrency longer → more cold starts → even slower
+```
+
+**Step 4: CloudWatch Logs Insights — find what's slow:**
+```sql
+-- Find slow invocations and their details
+fields @timestamp, @duration, @requestId
+| filter @duration > 500
+| sort @duration desc
+| limit 20
+
+-- If using structured logging:
+fields @timestamp, @duration, db_query_time, external_api_time, processing_time
+| filter @duration > 500
+| stats avg(db_query_time), avg(external_api_time), avg(processing_time)
+```
+
+**Step 5: X-Ray trace analysis:**
+```
+Typical trace breakdown:
+├── Lambda Initialization: 100ms (cold start only)
+├── Handler Start
+│   ├── DB Query 1: 50ms → 50ms (unchanged)
+│   ├── DB Query 2: 30ms → 300ms (10x SLOWER! ← ROOT CAUSE)
+│   ├── External API: 80ms → 80ms (unchanged)
+│   └── Processing: 20ms → 20ms (unchanged)
+└── Handler End
+
+Root cause: DB Query 2 became slow after deployment
+Possible reasons:
+├── New query introduced without index
+├── Table statistics stale after data migration
+├── Connection pool cold (new Lambda env = new connections)
+└── Downstream service throttling new code path
+```
+
+**Common deployment-related latency increases:**
+
+| Cause | How to Detect | Fix |
+|-------|---------------|-----|
+| New unindexed DB query | X-Ray shows DB subsegment slow | Add index |
+| Larger deployment package | InitDuration increased | Tree-shake, use layers |
+| New dependency loaded | InitDuration increased | Lazy-load imports |
+| Connection pool cold | First invocations slow, stabilizes | Connection reuse, provisioned concurrency |
+| Increased payload size | Processing time up | Optimize serialization |
+| New external API call added | X-Ray shows new subsegment | Async/cache the call |
+| VPC cold start (new ENI) | InitDuration = 8-15s | Provisioned concurrency |
+
+**Tricky**: Lambda `Duration` includes time waiting for downstream services (DB, APIs). A "slow Lambda" is often actually a "slow downstream." Always use X-Ray or structured logging to break down WHERE time is spent within the function.
+
+---
+
+
+**Q37: SCENARIO — ALB `HealthyHostCount` dropped from 4 to 2, but EC2 instances show as "running" with passing StatusChecks. Why are targets unhealthy?**
+
+**A:**
+
+**EC2 status checks and ALB health checks are COMPLETELY DIFFERENT!**
+
+```
+EC2 Status Checks (infrastructure level):
+├── System check: Hardware/hypervisor OK?
+├── Instance check: OS responsive? Network configured?
+└── Result: Both passing ✓ (instance is "running")
+
+ALB Health Check (application level):
+├── Sends HTTP GET to configured path (e.g., /health)
+├── Expects specific status code (200 by default)
+├── Within timeout (default 5s)
+├── Configured number of checks must pass
+└── Result: FAILING! Application not responding properly
+```
+
+**Common causes of ALB health check failure with healthy EC2:**
+
+1. **Application crashed but OS is fine:**
+```
+EC2 status: Running ✓ (Linux is up and responding to ARP)
+App status: Crashed (nginx/java/node process died)
+Health check: GET /health → Connection Refused → Unhealthy!
+
+Fix: Restart application, check app logs
+Prevent: Use systemd restart-on-failure, container orchestration
+```
+
+2. **Wrong port or path configured:**
+```
+App listens on: port 8080, path /api/health
+ALB health check: port 80, path /health → 404 → Unhealthy!
+
+Fix: Match health check config to actual app endpoint
+```
+
+3. **Application returning non-200 status:**
+```
+App responds but returns: 503 (maintenance mode after deployment)
+ALB expects: 200
+Result: Unhealthy!
+
+Fix: Configure ALB to accept 200-299 range, or fix app response
+Health check matcher: "200-299" instead of just "200"
+```
+
+4. **Security Group blocking health checks:**
+```
+ALB SG: Allows outbound to targets ✓
+Target SG: Allows inbound from internet (port 443) ✓
+Target SG: Does NOT allow inbound from ALB SG on health check port!
+Health check comes from ALB IP → blocked → timeout → Unhealthy!
+
+Fix: Allow inbound from ALB security group on health check port
+```
+
+5. **Health check timeout too aggressive:**
+```
+App startup time: 30 seconds
+Health check interval: 10s, timeout: 5s, unhealthy threshold: 2
+Result: App starting → first 2 checks fail → marked unhealthy BEFORE app is ready!
+
+Fix: Increase healthy threshold or add health check grace period
+ECS: healthCheckGracePeriodSeconds: 60
+```
+
+6. **Application memory/thread exhaustion:**
+```
+App is alive but TOO SLOW to respond within timeout
+Health check timeout: 5 seconds
+App response time: 8 seconds (under heavy load)
+Result: Timeout → Unhealthy → ALB removes target → remaining targets MORE overloaded → cascade!
+
+Fix: Separate lightweight health check endpoint (not affected by load)
+     /health → just return 200 (no DB query, no business logic)
+```
+
+**Debugging commands:**
+```bash
+# Check target health with details
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:...:targetgroup/my-tg/abc123
+
+# Output shows REASON for unhealthy:
+# "Target.ResponseCodeMismatch" → Wrong status code
+# "Target.Timeout" → Health check timed out
+# "Target.FailedHealthChecks" → Health check failed
+# "Elb.InitialHealthChecking" → Still in initial check period
+```
+
+**Tricky**: When ALB marks targets unhealthy, it stops sending traffic to them BUT continues health checking. If a target recovers, it must pass the "healthy threshold" number of consecutive checks before receiving traffic again. During this recovery period, you're still running on reduced capacity!
+
+---
+
+
+**Q38: SCENARIO — Your CloudWatch bill unexpectedly tripled this month. How do you identify what's costing so much?**
+
+**A:**
+
+**CloudWatch pricing components:**
+
+| Component | Price | Common Cost Driver |
+|-----------|-------|-------------------|
+| Custom metrics | $0.30/metric/month | Publishing too many unique dimension combinations |
+| API calls (GetMetricData) | $0.01/1,000 metrics requested | Dashboards refreshing frequently |
+| Logs ingestion | $0.50/GB | Verbose application logging |
+| Logs storage | $0.03/GB/month | Not setting retention policies! |
+| Alarms | $0.10/standard, $0.30/high-res | Many alarms per resource |
+| Dashboards | $3.00/dashboard/month | Many dashboards |
+| Contributor Insights | $0.02/rule/1M events matched | Rules on high-volume services |
+| Metric Streams | $0.003/metric update | Streaming everything to third party |
+
+**Investigation:**
+
+1. **Check AWS Cost Explorer with CloudWatch filter:**
+```
+Group by: Usage Type
+Look for: CW:MetricMonitorUsage (custom metrics)
+          CW:DataProcessing-Bytes (logs ingestion)
+          CW:TimedStorage-ByteHrs (logs storage)
+          CW:Requests (API calls)
+```
+
+2. **Most common cost explosions:**
+
+**A. Custom metrics with high-cardinality dimensions:**
+```
+BAD: Publishing metric per request_id → millions of unique metrics!
+cloudwatch.put_metric_data(
+    MetricData=[{
+        'MetricName': 'Latency',
+        'Dimensions': [{'Name': 'RequestId', 'Value': unique_id}]  # DANGER!
+    }]
+)
+# Each unique dimension combo = separate metric = $0.30/month
+
+GOOD: Use bounded dimensions only
+Dimensions: Service, Environment, StatusCode (limited values)
+```
+
+**B. CloudWatch Logs without retention:**
+```
+Default retention: NEVER EXPIRE (infinite storage!)
+Fix: Set retention policy on all log groups
+
+aws logs put-retention-policy \
+  --log-group-name /ecs/my-app \
+  --retention-in-days 30
+
+# Common retention settings:
+# Production: 30-90 days
+# Development: 7 days
+# Debug logs: 1-3 days
+```
+
+**C. Verbose logging (DEBUG level in production):**
+```
+Fix: Log at WARN/ERROR in production, DEBUG only in dev
+Reduce: Don't log full request/response bodies (just IDs + status)
+Compress: Use structured JSON logging (more efficient)
+```
+
+**D. Dashboard auto-refresh API calls:**
+```
+10 widgets × 20 metrics each × refresh every 60s = 288,000 GetMetricData calls/day
+Cost: ~$86/month just for ONE dashboard!
+
+Fix: 
+├── Reduce refresh rate (5 min instead of 1 min)
+├── Reduce time range (1 hour instead of 24 hours)
+├── Consolidate widgets (fewer API calls)
+└── Use cross-account dashboards instead of per-account
+```
+
+**Cost optimization checklist:**
+```bash
+# 1. Find log groups without retention (infinite storage!)
+aws logs describe-log-groups --query 'logGroups[?retentionInDays==`null`].logGroupName'
+
+# 2. Find log groups by size
+aws logs describe-log-groups --query 'logGroups[*].[logGroupName,storedBytes]' \
+  | sort -k2 -rn | head -10
+
+# 3. Count custom metrics per namespace
+aws cloudwatch list-metrics --namespace MyApp \
+  | jq '.Metrics | length'
+
+# 4. Check for unused alarms
+aws cloudwatch describe-alarms --state-value INSUFFICIENT_DATA \
+  | jq '.MetricAlarms[].AlarmName'
+```
+
+**Tricky**: EMF (Embedded Metric Format) is cheaper for high-volume custom metrics because you pay LOG INGESTION price ($0.50/GB) instead of PutMetricData API price. But EMF metrics still count as custom metrics ($0.30/metric/month). The savings is on the API call cost, not the metric storage.
+
+---
+
+
+**Q39: SCENARIO — You created a Composite Alarm combining 3 sub-alarms (CPU + Memory + 5xx errors) but it keeps flapping between OK and ALARM every few minutes. How do you stabilize it?**
+
+**A:**
+
+**Problem: Sub-alarms resolve at different times causing composite alarm oscillation.**
+
+```
+Timeline:
+T+0:  CPU alarm → ALARM
+T+1:  Memory alarm → ALARM  
+T+2:  5xx alarm → ALARM
+T+3:  Composite (ALL in alarm) → ALARM ← Triggers alert
+T+4:  CPU drops → CPU alarm → OK
+T+5:  Composite (not ALL in alarm) → OK ← Recovery alert
+T+6:  CPU spikes again → CPU alarm → ALARM
+T+7:  Composite → ALARM ← Another alert!
+T+8:  Memory recovers → Composite → OK ← Another recovery!
+...FLAPPING!
+```
+
+**Solutions:**
+
+1. **Use `ALARM_ACTIONS_SUPPRESSOR` (Suppression — wait before transitioning):**
+```bash
+# Wait 5 minutes after composite enters ALARM before taking action
+aws cloudwatch put-composite-alarm \
+  --alarm-name "ServiceDegraded" \
+  --alarm-rule 'ALARM(HighCPU) AND ALARM(High5xx)' \
+  --actions-suppressor "WaitToFire" \
+  --actions-suppressor-wait-period 300 \
+  --actions-suppressor-extension-period 300
+```
+
+2. **Change composite logic from AND to OR with suppression:**
+```
+Instead of: ALARM when ALL alarms fire (too strict, keeps cycling)
+Use: ALARM when ANY 2 of 3 fire (more stable signal)
+
+Alarm Rule: 'ALARM(HighCPU) AND ALARM(High5xx) OR ALARM(HighCPU) AND ALARM(HighMemory) OR ALARM(High5xx) AND ALARM(HighMemory)'
+```
+
+3. **Add hysteresis to sub-alarms:**
+```
+CPU Alarm:
+├── Enter ALARM: 3 out of 5 periods > 80% (hard to enter)
+├── Return to OK: 5 out of 5 periods < 60% (hard to leave)
+└── Gap between thresholds prevents oscillation
+
+# Use "TreatMissingData: breaching" during suppression to avoid premature OK
+```
+
+4. **Use longer evaluation periods on sub-alarms:**
+```
+Before: CPU > 80% for 1 out of 1 periods (60s) → flappy
+After:  CPU > 80% for 3 out of 5 periods (5min each, 25min window) → stable
+```
+
+5. **Add SNS filter for notification deduplication:**
+```python
+# Lambda behind SNS filters duplicate alerts
+def handler(event, context):
+    alarm_name = event['detail']['alarmName']
+    state = event['detail']['state']['value']
+    
+    # Check DynamoDB: was this alarm already notified in last 30 min?
+    last_alert = dynamodb.get_item(Key={'alarm': alarm_name})
+    if last_alert and (now - last_alert['timestamp']) < 1800:
+        return  # Suppress duplicate
+    
+    # Send alert and record
+    send_pagerduty_alert(alarm_name, state)
+    dynamodb.put_item(Item={'alarm': alarm_name, 'timestamp': now})
+```
+
+**Best practice composite alarm design:**
+```
+Tier 1: Warning (notify Slack)
+  Rule: ALARM(CPU > 70%) OR ALARM(Memory > 80%) OR ALARM(5xx > 10/min)
+  Action: Slack channel notification
+  Suppression: 5 minutes (avoid noise)
+
+Tier 2: Critical (page on-call)
+  Rule: ALARM(CPU > 90% for 10min) AND ALARM(5xx > 100/min)
+  Action: PagerDuty
+  Suppression: 10 minutes (confirmed sustained issue)
+
+Tier 3: Outage (page everyone)
+  Rule: ALARM(HealthyHosts = 0) OR ALARM(5xx_rate > 50%)
+  Action: PagerDuty + SMS + bridge call
+  Suppression: 0 (immediate for full outage)
+```
+
+**Tricky**: Composite alarms themselves DON'T have evaluation periods or data point requirements. They change state IMMEDIATELY when sub-alarm states change. All stability must come from sub-alarm configuration or suppression settings.
+
+---
+
+
+**Q40: SCENARIO — Production is down. CloudWatch Alarms are all green (OK). How is this possible and how do you prevent it?**
+
+**A:**
+
+**The most terrifying scenario: "All lights green, everything's broken."**
+
+**Why alarms can be green during an outage:**
+
+1. **Metric stopped publishing (INSUFFICIENT_DATA treated as OK):**
+```
+Application crashed → no more metrics published → alarm state = INSUFFICIENT_DATA
+If configured with TreatMissingData: "notBreaching" → alarm stays OK!
+
+Fix: Set TreatMissingData: "breaching" for critical alarms
+Or: Set INSUFFICIENT_DATA action to also alert
+```
+
+2. **Monitoring only infrastructure, not business:**
+```
+Alarms exist for: CPU, Memory, Disk → All OK (infra is fine!)
+Missing alarms for: Order rate, Login success, API response time
+Application bug returns 200 OK with empty/wrong data → infra metrics normal
+
+Fix: Add business-level metrics:
+├── Orders per minute (drops to 0 = outage!)
+├── Successful logins per minute
+├── Revenue per minute
+└── Custom: "HeartbeatMetric" (app publishes "1" every minute)
+```
+
+3. **Health checks checking the wrong thing:**
+```
+Health endpoint: /health → returns 200 (checks if process alive)
+But: Main endpoint /api/orders → returning 500 (DB connection pool exhausted)
+ALB health check passes → targets stay "healthy" → no alarm
+
+Fix: Deep health checks that verify actual functionality
+GET /health/deep → checks DB, cache, downstream services
+```
+
+4. **Alarm threshold never reached:**
+```
+Alarm: 5xx > 1000/minute
+Actual: 5xx = 999/minute (just below threshold) for hours!
+Users are suffering but alarm doesn't fire.
+
+Fix: Use percentage-based alarms: 5xx_rate > 5%
+Or: Use Anomaly Detection (detects unusual patterns)
+```
+
+5. **Wrong dimension — alarm on wrong resource:**
+```
+Alarm configured on: InstanceId=i-old123 (was replaced during deployment!)
+Current instance: i-new456 (has no alarm!)
+
+Fix: Use ASG/Service-level metrics (not instance-level)
+     Or use tag-based metric filtering
+     Or use CloudFormation/Terraform to ensure alarms match resources
+```
+
+6. **CloudWatch delay (metrics not yet available):**
+```
+Some metrics have 1-5 minute publication delay
+If outage started 2 minutes ago → metrics haven't arrived → alarms still OK
+
+Fix: Add synthetic monitoring (actively probes) in addition to passive metrics
+     CloudWatch Synthetics canary checks every 1 minute
+```
+
+**The "Dead Man's Switch" pattern:**
+```python
+# Application publishes "1" every minute
+# Alarm: Metric < 1 for 3 consecutive periods = app is DEAD
+
+def health_heartbeat():
+    cloudwatch.put_metric_data(
+        Namespace='MyApp/Heartbeat',
+        MetricData=[{
+            'MetricName': 'IsAlive',
+            'Value': 1,
+            'Unit': 'Count'
+        }]
+    )
+
+# Alarm:
+# If IsAlive Sum < 1 for 3 periods (3 minutes) → CRITICAL
+# Treat missing data as "breaching" (no data = app dead!)
+```
+
+**Complete monitoring gap prevention checklist:**
+```
+□ Business metrics (orders, revenue, logins) — not just infra
+□ Synthetic monitoring (active probing every 1-5 minutes)
+□ Heartbeat metrics ("dead man's switch")
+□ TreatMissingData = "breaching" for critical alarms
+□ INSUFFICIENT_DATA state also triggers notification
+□ Health checks verify actual functionality (not just process alive)
+□ Percentage-based thresholds (not absolute numbers)
+□ Anomaly Detection for baseline deviations
+□ Dashboard with "last updated" timestamps (detect stale data)
+□ External monitoring (Route53 health checks, third-party uptime tool)
+```
+
+**Tricky**: The worst outages are the ones where your monitoring agrees everything is fine. This happens when you only monitor SYMPTOMS you've seen before. You need ANOMALY DETECTION to catch the scenarios you haven't imagined yet. CloudWatch Anomaly Detection uses ML to baseline normal behavior and alerts on deviations.
+
+---
